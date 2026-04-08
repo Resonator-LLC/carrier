@@ -3,7 +3,7 @@
  *  Carrier — Cross-platform C library for the Tox protocol.
  *  Part of the Resonator project.
  *
- *  Copyright (c) 2025-2026 Resonator LLC
+ *  Copyright (c) 2026-2027 Resonator LLC
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.

@@ -3,7 +3,7 @@
  *  Core implementation of the Carrier library.
  *  Wraps toxcore to provide a clean C API with event callbacks.
  *
- *  Copyright (c) 2025-2026 Resonator LLC
+ *  Copyright (c) 2026-2027 Resonator LLC
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
