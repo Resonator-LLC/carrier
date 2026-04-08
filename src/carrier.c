@@ -5,7 +5,8 @@
  *
  *  Copyright (C) 2026 Carrier contributors.
  *
- * *  This file is part of Carrier.
+ *  This file is part of Carrier. Carrier is free software licensed
+ *  under the GNU General Public License 3.0.
  */
 
 #include "carrier.h"

@@ -1,6 +1,7 @@
 /*  turtle_emit.h
  *
- * *  This file is part of Carrier.
+ *  This file is part of Carrier. Carrier is free software licensed
+ *  under the GNU General Public License 3.0.
  */
 
 #ifndef TURTLE_EMIT_H

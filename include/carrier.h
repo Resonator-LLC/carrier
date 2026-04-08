@@ -5,11 +5,17 @@
  *
  *  Copyright (C) 2026 Carrier contributors.
  *
- * *  This file is part of Carrier.
+ *  This file is part of Carrier. Carrier is free software licensed
+ *  under the GNU General Public License 3.0.
  */
 
 #ifndef CARRIER_H
 #define CARRIER_H
+
+#define CARRIER_VERSION_MAJOR 2
+#define CARRIER_VERSION_MINOR 0
+#define CARRIER_VERSION_PATCH 0
+#define CARRIER_VERSION_STRING "2.0.0"
 
 #include <stdbool.h>
 #include <stddef.h>

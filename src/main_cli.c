@@ -4,7 +4,8 @@
  *  Reads RDF Turtle commands from stdin, emits events to stdout.
  *  Supports --pipe mode for raw bidirectional data transfer.
  *
- * *  This file is part of Carrier.
+ *  This file is part of Carrier. Carrier is free software licensed
+ *  under the GNU General Public License 3.0.
  */
 
 #include "carrier.h"

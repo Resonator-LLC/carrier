@@ -1,0 +1,96 @@
+.TH CARRIER-CLI 1 "2026-03-23" "Carrier 2.0.0" "Carrier Manual"
+.SH NAME
+carrier-cli \- streaming CLI for the Tox protocol using RDF Turtle
+.SH SYNOPSIS
+.B carrier-cli
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B carrier-cli
+is a streaming command-line interface for the Tox peer-to-peer encrypted
+messaging protocol. It reads RDF 1.1 Turtle commands from stdin and emits
+Turtle events to stdout, enabling composability with Unix pipes and scripts.
+.PP
+Part of the Carrier library and the Resonator project.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-profile " " \fIPATH\fR
+Path to Tox profile file. Created if it does not exist.
+Default: \fIcarrier_profile.tox\fR
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Path to configuration file.
+.TP
+.BR \-n ", " \-\-nodes " " \fIPATH\fR
+Path to DHT bootstrap nodes JSON file.
+.TP
+.BR \-\-fifo\-in " " \fIPATH\fR
+Read commands from a named pipe (FIFO) instead of stdin.
+.TP
+.BR \-\-fifo\-out " " \fIPATH\fR
+Write events to a named pipe (FIFO) instead of stdout.
+.TP
+.BR \-\-pipe " " \fIFRIEND_ID\fR
+Enter raw bidirectional pipe mode with the specified friend.
+Stdin/stdout become raw byte streams over the Tox connection.
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.SH TURTLE PROTOCOL
+Commands are single-line RDF Turtle statements:
+.PP
+.RS
+[] a carrier:TypeName ; carrier:predicate "value" .
+.RE
+.PP
+.SS Input Commands
+.TP
+.B carrier:SelfId
+Get own Tox ID.
+.TP
+.B carrier:Nick
+Set nickname. Requires \fBcarrier:nick\fR.
+.TP
+.B carrier:FriendRequest
+Send friend request. Requires \fBcarrier:id\fR and \fBcarrier:message\fR.
+.TP
+.B carrier:TextMessage
+Send message. Requires \fBcarrier:friendId\fR and \fBcarrier:text\fR.
+.TP
+.B carrier:Save
+Save profile to disk.
+.TP
+.B carrier:Quit
+Shut down cleanly.
+.SS Output Events
+Events are emitted as Turtle statements to stdout with timestamps and
+metadata. Types include: Connected, Disconnected, SelfId, TextMessage,
+FriendRequest, FriendOnline, FriendOffline, Error, System, and more.
+.SH EXAMPLES
+Get own Tox ID:
+.PP
+.RS
+echo '[] a carrier:SelfId .' | carrier-cli \-p /tmp/test.tox
+.RE
+.PP
+Send a message to friend 0:
+.PP
+.RS
+echo '[] a carrier:TextMessage ; carrier:friendId 0 ; carrier:text "Hi" .' | carrier-cli
+.RE
+.PP
+Transfer a file via pipe mode:
+.PP
+.RS
+cat file.mov | carrier-cli \-\-pipe 0 \-p alice.tox
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit (received Quit command or EOF).
+.TP
+.B 1
+Error during initialization or runtime.
+.SH SEE ALSO
+Project documentation: https://source.resonator.network/resonator/carrier
+.SH LICENSE
+GPL-3.0. Copyright (C) 2026 Carrier contributors.

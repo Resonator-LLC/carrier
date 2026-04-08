@@ -5,3 +5,4 @@ build/
 *.dylib
 *.tox
 .DS_Store
+.claude/

@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: carrier
+Description: Cross-platform C library for the Tox protocol
+Version: @VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -lcarrier
+Libs.private: -ltoxcore -lsodium -lopus -lvpx -lpthread
