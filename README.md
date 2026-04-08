@@ -1,6 +1,6 @@
 # Carrier
 
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](CHANGELOG.md)
 
 Cross-platform C library and streaming CLI for the Tox protocol. Part of the Resonator project.
@@ -266,4 +266,4 @@ make asan     # build with AddressSanitizer
 
 ## License
 
-GPL-3.0 — See [LICENSE](LICENSE)
+MIT — See [LICENSE](LICENSE)

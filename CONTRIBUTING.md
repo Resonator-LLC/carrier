@@ -69,4 +69,4 @@ See [SECURITY.md](SECURITY.md) for reporting security issues. Do **not** open a 
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under GPL-3.0, consistent with the project license.
+By contributing, you agree that your contributions will be licensed under MIT, consistent with the project license.

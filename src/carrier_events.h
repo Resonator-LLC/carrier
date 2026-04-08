@@ -3,7 +3,7 @@
  *  Internal event helpers for Carrier.
  *
  *  This file is part of Carrier. Carrier is free software licensed
- *  under the GNU General Public License 3.0.
+ *  under the MIT License.
  */
 
 #ifndef CARRIER_EVENTS_H

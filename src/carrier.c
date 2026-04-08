@@ -3,10 +3,10 @@
  *  Core implementation of the Carrier library.
  *  Wraps toxcore to provide a clean C API with event callbacks.
  *
- *  Copyright (C) 2026 Carrier contributors.
+ *  Copyright (c) 2025-2026 Resonator LLC
  *
  *  This file is part of Carrier. Carrier is free software licensed
- *  under the GNU General Public License 3.0.
+ *  under the MIT License.
  */
 
 #include "carrier.h"
