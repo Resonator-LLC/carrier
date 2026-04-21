@@ -223,6 +223,35 @@ typedef struct {
 typedef void (*carrier_event_cb)(const CarrierEvent *event, void *userdata);
 
 /* ---------------------------------------------------------------------------
+ * Logging
+ *
+ * Operational DEBUG/INFO/WARN/ERROR records distinct from protocol events.
+ * The library never writes to stdout or stderr itself — all log output is
+ * delivered through a caller-registered callback. Embedders (e.g. Antenna)
+ * route records into their own logger; carrier-cli provides a default sink
+ * that writes to stderr in canonical format.
+ * ---------------------------------------------------------------------------*/
+
+typedef enum {
+    CARRIER_LOG_ERROR = 0,
+    CARRIER_LOG_WARN,
+    CARRIER_LOG_INFO,
+    CARRIER_LOG_DEBUG,
+} CarrierLogLevel;
+
+#define CARRIER_LOG_TAG_LEN     16
+#define CARRIER_LOG_MESSAGE_LEN 512
+
+typedef struct {
+    CarrierLogLevel level;
+    int64_t         timestamp_ms;                  /* CLOCK_REALTIME ms */
+    char            tag[CARRIER_LOG_TAG_LEN];      /* e.g. "TOX", "DHT" */
+    char            message[CARRIER_LOG_MESSAGE_LEN]; /* single-line, no trailing newline */
+} CarrierLogRecord;
+
+typedef void (*carrier_log_cb)(const CarrierLogRecord *record, void *userdata);
+
+/* ---------------------------------------------------------------------------
  * Lifecycle
  * ---------------------------------------------------------------------------*/
 
@@ -232,12 +261,23 @@ typedef void (*carrier_event_cb)(const CarrierEvent *event, void *userdata);
  * profile_path: path to .tox profile file (created if doesn't exist)
  * config_path:  path to config file, or NULL for defaults
  * nodes_path:   path to DHT nodes JSON file, or NULL to skip bootstrap
+ * log_cb:       log sink, or NULL to disable logging entirely.
+ *               Captures records emitted during construction itself
+ *               (e.g. tox_new failures, initial bootstrap).
+ * log_userdata: opaque pointer passed back to log_cb on every record.
+ *
+ * Default log level after construction is CARRIER_LOG_DEBUG — all records
+ * flow to the callback. The callback is expected to filter (embedders
+ * typically delegate to their own logger, e.g. Antenna's tracing). Call
+ * carrier_set_log_level() to gate records before they reach the callback.
  *
  * Returns NULL on failure.
  */
 Carrier *carrier_new(const char *profile_path,
                      const char *config_path,
-                     const char *nodes_path);
+                     const char *nodes_path,
+                     carrier_log_cb log_cb,
+                     void          *log_userdata);
 
 /*
  * Free a Carrier instance and all associated resources.
@@ -261,6 +301,17 @@ int carrier_iteration_interval(Carrier *c);
  * ---------------------------------------------------------------------------*/
 
 void carrier_set_event_callback(Carrier *c, carrier_event_cb cb, void *userdata);
+
+/* ---------------------------------------------------------------------------
+ * Log configuration
+ * ---------------------------------------------------------------------------*/
+
+/* Register (or clear) the log sink. NULL cb disables all logging. */
+void carrier_set_log_callback(Carrier *c, carrier_log_cb cb, void *userdata);
+
+/* Set the minimum level. Records below this are discarded without formatting.
+ * Default: CARRIER_LOG_ERROR. */
+void carrier_set_log_level(Carrier *c, CarrierLogLevel level);
 
 /* ---------------------------------------------------------------------------
  * Identity & status

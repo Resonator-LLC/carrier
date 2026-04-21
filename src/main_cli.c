@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_running = 1;
@@ -29,6 +30,68 @@ static void handle_sigint(int sig)
 {
     (void)sig;
     g_running = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Log level parsing + default stderr sink
+ *
+ * Canonical output format (see arch/log.md and the DEBUG logging proposal):
+ *     <ISO-8601-ms> <LEVEL> [TAG] message
+ *
+ * Example:
+ *     2026-04-21T17:42:03.412Z DEBUG [DHT] bootstrap host=tox.plastiras.org ...
+ * ---------------------------------------------------------------------------*/
+
+static const char *log_level_str(CarrierLogLevel level)
+{
+    switch (level) {
+        case CARRIER_LOG_ERROR: return "ERROR";
+        case CARRIER_LOG_WARN:  return "WARN";
+        case CARRIER_LOG_INFO:  return "INFO";
+        case CARRIER_LOG_DEBUG: return "DEBUG";
+        default:                return "?";
+    }
+}
+
+/* Parse a level name. Returns true on success; *out untouched on failure. */
+static bool parse_log_level(const char *s, CarrierLogLevel *out)
+{
+    if (s == NULL) return false;
+    if (strcasecmp(s, "error") == 0) { *out = CARRIER_LOG_ERROR; return true; }
+    if (strcasecmp(s, "warn")  == 0) { *out = CARRIER_LOG_WARN;  return true; }
+    if (strcasecmp(s, "info")  == 0) { *out = CARRIER_LOG_INFO;  return true; }
+    if (strcasecmp(s, "debug") == 0) { *out = CARRIER_LOG_DEBUG; return true; }
+    return false;
+}
+
+/* Userdata handed to cli_log_sink by main_cli so the sink can filter
+ * records above the user-requested level. The library delivers everything
+ * at DEBUG; this sink is the gate for carrier-cli's stderr. */
+struct cli_log_ctx {
+    FILE            *out;
+    CarrierLogLevel  min_level;  /* records with level > min_level are dropped */
+};
+
+static void cli_log_sink(const CarrierLogRecord *rec, void *userdata)
+{
+    struct cli_log_ctx *ctx = (struct cli_log_ctx *)userdata;
+    if (ctx == NULL || ctx->out == NULL || rec == NULL) return;
+
+    if ((int)rec->level > (int)ctx->min_level) return;
+
+    /* Format timestamp as ISO-8601 UTC with millisecond precision. */
+    time_t secs = (time_t)(rec->timestamp_ms / 1000);
+    int ms = (int)(rec->timestamp_ms % 1000);
+    struct tm tm_buf;
+    gmtime_r(&secs, &tm_buf);
+
+    char tsbuf[32];
+    strftime(tsbuf, sizeof(tsbuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+
+    fprintf(ctx->out, "%s.%03dZ %-5s [%s] %s\n",
+            tsbuf, ms, log_level_str(rec->level),
+            rec->tag[0] ? rec->tag : "?", rec->message);
+    fflush(ctx->out);
 }
 
 /* ---------------------------------------------------------------------------
@@ -285,6 +348,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -n, --nodes PATH      DHT nodes JSON file\n");
     fprintf(stderr, "  --fifo-in PATH        Read from named pipe instead of stdin\n");
     fprintf(stderr, "  --fifo-out PATH       Write to named pipe instead of stdout\n");
+    fprintf(stderr, "  --log LEVEL           Log level: error|warn|info|debug (default: error).\n"
+                    "                        Falls back to CARRIER_LOG env var if unset.\n");
     fprintf(stderr, "  -h, --help            Show this help\n");
 }
 
@@ -295,6 +360,7 @@ int main(int argc, char **argv)
     const char *nodes_path = NULL;
     const char *fifo_in_path = NULL;
     const char *fifo_out_path = NULL;
+    const char *log_level_arg = NULL;
     int pipe_friend = -1;
 
     static struct option long_opts[] = {
@@ -304,6 +370,7 @@ int main(int argc, char **argv)
         {"pipe",     required_argument, 0, 'P'},
         {"fifo-in",  required_argument, 0, 'I'},
         {"fifo-out", required_argument, 0, 'O'},
+        {"log",      required_argument, 0, 'L'},
         {"help",     no_argument,       0, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -318,6 +385,7 @@ int main(int argc, char **argv)
             case 'P': pipe_friend = atoi(optarg); break;
             case 'I': fifo_in_path = optarg; break;
             case 'O': fifo_out_path = optarg; break;
+            case 'L': log_level_arg = optarg; break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -325,6 +393,18 @@ int main(int argc, char **argv)
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    /* Resolve log level: --log flag wins; CARRIER_LOG env var is fallback;
+     * default is ERROR. */
+    CarrierLogLevel log_level = CARRIER_LOG_ERROR;
+    const char *level_src = log_level_arg;
+    if (level_src == NULL) {
+        level_src = getenv("CARRIER_LOG");
+    }
+    if (level_src != NULL && !parse_log_level(level_src, &log_level)) {
+        fprintf(stderr, "carrier: invalid log level: %s\n", level_src);
+        return 1;
     }
 
     /* Set up I/O */
@@ -357,7 +437,11 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
-    Carrier *c = carrier_new(profile_path, config_path, nodes_path);
+    /* Sink userdata. Must outlive carrier_free(). Stack in main() is fine. */
+    struct cli_log_ctx log_ctx = { .out = stderr, .min_level = log_level };
+
+    Carrier *c = carrier_new(profile_path, config_path, nodes_path,
+                             cli_log_sink, &log_ctx);
 
     if (c == NULL) {
         fprintf(stderr, "Failed to initialize Carrier\n");

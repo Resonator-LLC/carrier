@@ -234,7 +234,9 @@ void on_event(const CarrierEvent *ev, void *ctx) {
 }
 
 int main(void) {
-    Carrier *c = carrier_new("profile.tox", NULL, NULL);
+    /* Pass NULL log callback to disable logging (library never
+     * writes to stdout or stderr on its own). */
+    Carrier *c = carrier_new("profile.tox", NULL, NULL, NULL, NULL);
     carrier_set_event_callback(c, on_event, NULL);
     carrier_set_nick(c, "MyBot");
 

@@ -12,6 +12,7 @@
 #include "carrier.h"
 #include "carrier_internal.h"
 #include "carrier_events.h"
+#include "carrier_log.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -28,10 +29,24 @@
  * Tox callbacks → CarrierEvent emission
  * ---------------------------------------------------------------------------*/
 
+static const char *tox_conn_str(int s)
+{
+    switch (s) {
+        case TOX_CONNECTION_NONE: return "NONE";
+        case TOX_CONNECTION_TCP:  return "TCP";
+        case TOX_CONNECTION_UDP:  return "UDP";
+        default:                  return "?";
+    }
+}
+
 static void cb_self_connection_status(Tox *tox, Tox_Connection status, void *userdata)
 {
     (void)tox;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_INFO(c, "DHT", "self-connection prev=%s state=%s",
+              tox_conn_str(c->self_connection_status),
+              tox_conn_str((int)status));
 
     if (status != TOX_CONNECTION_NONE && c->self_connection_status == TOX_CONNECTION_NONE) {
         carrier_emit_connected(c, (int)status);
@@ -59,9 +74,14 @@ static void cb_friend_request(Tox *tox, const uint8_t *public_key,
     }
 
     if (slot < 0) {
+        CLOG_WARN(c, "FRIEND", "friend-request queue full (max=%d)",
+                  CARRIER_MAX_FRIEND_REQUESTS);
         carrier_emit_error(c, "FriendRequest", "Friend request queue full");
         return;
     }
+
+    CLOG_DEBUG(c, "FRIEND", "friend-request slot=%d msg_len=%zu",
+               slot, length);
 
     c->friend_requests[slot].active = true;
     memcpy(c->friend_requests[slot].public_key, public_key, TOX_PUBLIC_KEY_SIZE);
@@ -97,6 +117,9 @@ static void cb_friend_message(Tox *tox, uint32_t friend_number,
     (void)type;
     Carrier *c = (Carrier *)userdata;
 
+    CLOG_DEBUG(c, "FRIEND", "message recv friend=%u bytes=%zu",
+               friend_number, length);
+
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = CARRIER_EVENT_TEXT_MESSAGE;
@@ -123,6 +146,9 @@ static void cb_friend_connection_status(Tox *tox, uint32_t friend_number,
 {
     (void)tox;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_INFO(c, "FRIEND", "friend=%u connection=%s",
+              friend_number, tox_conn_str((int)status));
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -426,11 +452,13 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
     Carrier *c = (Carrier *)userdata;
 
     if (length < 1) {
+        CLOG_WARN(c, "PIPE", "recv friend=%u length=0", friend_number);
         return;
     }
 
     switch (data[0]) {
         case CARRIER_PIPE_OPEN_TAG: {
+            CLOG_DEBUG(c, "PIPE", "recv open friend=%u", friend_number);
             CarrierEvent ev;
             memset(&ev, 0, sizeof(ev));
             ev.type = CARRIER_EVENT_PIPE;
@@ -440,6 +468,8 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
         }
 
         case CARRIER_PIPE_DATA_TAG: {
+            CLOG_DEBUG(c, "PIPE", "recv data friend=%u bytes=%zu",
+                       friend_number, length - 1);
             CarrierEvent ev;
             memset(&ev, 0, sizeof(ev));
             ev.type = CARRIER_EVENT_PIPE_DATA;
@@ -451,6 +481,7 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
         }
 
         case CARRIER_PIPE_EOF_TAG: {
+            CLOG_DEBUG(c, "PIPE", "recv eof friend=%u", friend_number);
             CarrierEvent ev;
             memset(&ev, 0, sizeof(ev));
             ev.type = CARRIER_EVENT_PIPE_EOF;
@@ -458,6 +489,11 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
             carrier_emit(c, &ev);
             break;
         }
+
+        default:
+            CLOG_WARN(c, "PIPE", "recv unknown tag=0x%02x friend=%u bytes=%zu",
+                      data[0], friend_number, length);
+            break;
     }
 }
 
@@ -516,12 +552,14 @@ static bool load_profile(Carrier *c, struct Tox_Options *opts)
         c->tox = tox_new(opts, &err);
 
         if (c->tox == NULL) {
-            fprintf(stderr, "carrier: tox_new() failed: %d\n", err);
+            CLOG_ERROR(c, "TOX", "tox_new failed (new profile) err=%d", err);
+            carrier_emit_error(c, "Init", "tox_new failed (err %d)", err);
             return false;
         }
 
         tox_self_set_name(c->tox, (const uint8_t *)"Carrier User",
                           strlen("Carrier User"), NULL);
+        CLOG_INFO(c, "TOX", "new profile created path=%s", c->profile_path);
         return true;
     }
 
@@ -555,10 +593,14 @@ static bool load_profile(Carrier *c, struct Tox_Options *opts)
     free(data);
 
     if (c->tox == NULL) {
-        fprintf(stderr, "carrier: tox_new() failed: %d\n", err);
+        CLOG_ERROR(c, "TOX", "tox_new failed (load profile) err=%d path=%s",
+                   err, c->profile_path);
+        carrier_emit_error(c, "Init", "tox_new failed loading profile (err %d)", err);
         return false;
     }
 
+    CLOG_INFO(c, "TOX", "profile loaded path=%s bytes=%ld",
+              c->profile_path, len);
     return true;
 }
 
@@ -607,8 +649,16 @@ static void bootstrap_default(Carrier *c)
             key_bin[j] = (uint8_t)b;
         }
 
-        tox_bootstrap(c->tox, default_nodes[i].ip, default_nodes[i].port,
-                      key_bin, NULL);
+        Tox_Err_Bootstrap berr = TOX_ERR_BOOTSTRAP_OK;
+        bool ok = tox_bootstrap(c->tox, default_nodes[i].ip, default_nodes[i].port,
+                                key_bin, &berr);
+
+        /* 8-hex-char prefix is enough to identify the node without polluting
+         * logs with 64 hex chars. */
+        CLOG_DEBUG(c, "DHT",
+                   "bootstrap host=%s port=%u key=%.8s ok=%s err=%d",
+                   default_nodes[i].ip, default_nodes[i].port, hex,
+                   ok ? "true" : "false", (int)berr);
     }
 }
 
@@ -618,7 +668,9 @@ static void bootstrap_default(Carrier *c)
 
 Carrier *carrier_new(const char *profile_path,
                      const char *config_path,
-                     const char *nodes_path)
+                     const char *nodes_path,
+                     carrier_log_cb log_cb,
+                     void          *log_userdata)
 {
     (void)config_path;  /* TODO: load libconfig settings */
 
@@ -627,6 +679,14 @@ Carrier *carrier_new(const char *profile_path,
     if (c == NULL) {
         return NULL;
     }
+
+    /* Install log sink FIRST so every subsequent step is visible.
+     * Default level = DEBUG so all records flow to the sink during init;
+     * the sink (or a later carrier_set_log_level call) applies filtering.
+     * Antenna's tracing does final filtering downstream. */
+    c->log_cb = log_cb;
+    c->log_userdata = log_userdata;
+    c->log_level = CARRIER_LOG_DEBUG;
 
     if (profile_path != NULL) {
         c->profile_path = strdup(profile_path);
@@ -804,10 +864,14 @@ int carrier_bootstrap(Carrier *c, const char *host, uint16_t port,
     tox_bootstrap(c->tox, host, port, key_bin, &err);
 
     if (err != TOX_ERR_BOOTSTRAP_OK) {
+        CLOG_ERROR(c, "DHT", "bootstrap host=%s port=%u err=%d",
+                   host, port, (int)err);
         carrier_emit_error(c, "Bootstrap", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_DEBUG(c, "DHT", "bootstrap host=%s port=%u key=%.8s ok=true",
+               host, port, key_hex);
     return 0;
 }
 
@@ -887,10 +951,12 @@ int carrier_add_friend(Carrier *c, const char *tox_id_hex, const char *message)
                                          (const uint8_t *)msg, strlen(msg), &err);
 
     if (err != TOX_ERR_FRIEND_ADD_OK) {
+        CLOG_ERROR(c, "FRIEND", "add id=%.8s err=%d", tox_id_hex, (int)err);
         carrier_emit_error(c, "AddFriend", "Failed to add friend (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "FRIEND", "add friend=%u id=%.8s", friend_num, tox_id_hex);
     carrier_emit_system(c, "Friend added as #%u", friend_num);
     return (int)friend_num;
 }
@@ -969,10 +1035,14 @@ int carrier_send_message(Carrier *c, uint32_t friend_id, const char *text)
         (const uint8_t *)text, strlen(text), &err);
 
     if (err != TOX_ERR_FRIEND_SEND_MESSAGE_OK) {
+        CLOG_WARN(c, "FRIEND", "send-message friend=%u err=%d",
+                  friend_id, (int)err);
         carrier_emit_error(c, "SendMsg", "Failed to send message (error %d)", err);
         return -1;
     }
 
+    CLOG_DEBUG(c, "FRIEND", "send-message friend=%u bytes=%zu receipt=%u",
+               friend_id, strlen(text), receipt);
     return (int)receipt;
 }
 
@@ -1263,10 +1333,15 @@ int carrier_pipe_open(Carrier *c, uint32_t friend_id)
     tox_friend_send_lossless_packet(c->tox, friend_id, packet, 1, &err);
 
     if (err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-        /* Don't emit error — caller may be polling for connectivity */
+        /* Don't emit error — caller may be polling for connectivity.
+         * Log at DEBUG only: expected during connectivity poll, would be
+         * very spammy at higher levels. */
+        CLOG_DEBUG(c, "PIPE", "send open friend=%u err=%d (poll)",
+                   friend_id, (int)err);
         return -1;
     }
 
+    CLOG_DEBUG(c, "PIPE", "send open friend=%u", friend_id);
     return 0;
 }
 
@@ -1297,6 +1372,12 @@ int carrier_pipe_write(Carrier *c, uint32_t friend_id,
         free(packet);
 
         if (err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+            /* Common case: TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ — Tox's queue
+             * is full. Caller retries after iterate. Not an error. */
+            CLOG_DEBUG(c, "PIPE",
+                       "write friend=%u chunk=%zu sent=%zu err=%d",
+                       friend_id, chunk, sent, (int)err);
+
             if (sent > 0) {
                 return (int)sent;  /* partial send */
             }
@@ -1307,6 +1388,7 @@ int carrier_pipe_write(Carrier *c, uint32_t friend_id,
         sent += chunk;
     }
 
+    CLOG_DEBUG(c, "PIPE", "write friend=%u bytes=%zu", friend_id, sent);
     return (int)sent;
 }
 
@@ -1322,9 +1404,12 @@ int carrier_pipe_close(Carrier *c, uint32_t friend_id)
     tox_friend_send_lossless_packet(c->tox, friend_id, packet, 1, &err);
 
     if (err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+        CLOG_WARN(c, "PIPE", "send eof friend=%u err=%d",
+                  friend_id, (int)err);
         return -1;
     }
 
+    CLOG_DEBUG(c, "PIPE", "send eof friend=%u", friend_id);
     return 0;
 }
 

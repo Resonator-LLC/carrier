@@ -45,6 +45,11 @@ struct Carrier {
     carrier_event_cb event_cb;
     void            *event_userdata;
 
+    /* Log callback */
+    carrier_log_cb   log_cb;
+    void            *log_userdata;
+    CarrierLogLevel  log_level;
+
     /* Connection tracking */
     int    self_connection_status;  /* Tox_Connection */
 

@@ -42,7 +42,7 @@ SERD_OBJ = $(addprefix $(BUILD_DIR)/serd_, $(SERD_SRC:.c=.o))
 SERD_CFLAGS = -std=c11 -w -I$(SERD_INC) -I$(SERD_SRC_DIR) -DSERD_STATIC
 
 # Library objects (no main)
-LIB_SRC = carrier.c carrier_events.c
+LIB_SRC = carrier.c carrier_events.c carrier_log.c
 LIB_OBJ = $(addprefix $(BUILD_DIR)/, $(LIB_SRC:.c=.o))
 
 # CLI objects
