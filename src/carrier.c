@@ -245,8 +245,11 @@ static void cb_file_recv(Tox *tox, uint32_t friend_number, uint32_t file_number,
                          void *userdata)
 {
     (void)tox;
-    (void)kind;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_INFO(c, "FILE", "recv request friend=%u file=%u kind=%u size=%llu name_len=%zu",
+              friend_number, file_number, kind,
+              (unsigned long long)file_size, filename_length);
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -273,6 +276,9 @@ static void cb_group_message(Tox *tox, uint32_t group_number, uint32_t peer_id,
     (void)type;
     (void)msg_id;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_DEBUG(c, "GROUP", "message recv group=%u peer=%u bytes=%zu",
+               group_number, peer_id, length);
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -307,6 +313,9 @@ static void cb_group_invite(Tox *tox, uint32_t friend_number,
     (void)length;
     Carrier *c = (Carrier *)userdata;
 
+    CLOG_INFO(c, "GROUP", "invite recv friend=%u name_len=%zu invite_len=%zu",
+              friend_number, group_name_length, length);
+
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = CARRIER_EVENT_GROUP_INVITE;
@@ -325,6 +334,9 @@ static void cb_group_peer_join(Tox *tox, uint32_t group_number,
 {
     (void)tox;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_INFO(c, "GROUP", "peer-join group=%u peer=%u",
+              group_number, peer_id);
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -349,6 +361,8 @@ static void cb_group_self_join(Tox *tox, uint32_t group_number, void *userdata)
     (void)tox;
     Carrier *c = (Carrier *)userdata;
 
+    CLOG_INFO(c, "GROUP", "self-join group=%u", group_number);
+
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = CARRIER_EVENT_GROUP_SELF_JOIN;
@@ -363,6 +377,11 @@ static void cb_av_call(ToxAV *av, uint32_t friend_number,
 {
     (void)av;
     Carrier *c = (Carrier *)userdata;
+
+    CLOG_INFO(c, "AV", "call recv friend=%u audio=%s video=%s",
+              friend_number,
+              audio_enabled ? "true" : "false",
+              video_enabled ? "true" : "false");
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -380,6 +399,9 @@ static void cb_av_call_state(ToxAV *av, uint32_t friend_number,
     (void)av;
     Carrier *c = (Carrier *)userdata;
 
+    CLOG_INFO(c, "AV", "call-state friend=%u state=0x%x",
+              friend_number, state);
+
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = CARRIER_EVENT_CALL_STATE;
@@ -389,6 +411,9 @@ static void cb_av_call_state(ToxAV *av, uint32_t friend_number,
     carrier_emit(c, &ev);
 }
 
+/* Rate-limit: log first frame + every 100th after. Counts only, never payload. */
+#define CARRIER_AV_FRAME_LOG_EVERY 100
+
 static void cb_av_audio_receive_frame(ToxAV *av, uint32_t friend_number,
                                       const int16_t *pcm, size_t sample_count,
                                       uint8_t channels, uint32_t sampling_rate,
@@ -396,6 +421,17 @@ static void cb_av_audio_receive_frame(ToxAV *av, uint32_t friend_number,
 {
     (void)av;
     Carrier *c = (Carrier *)userdata;
+
+    c->av_audio_recv_frames++;
+
+    if (c->av_audio_recv_frames == 1 ||
+        c->av_audio_recv_frames % CARRIER_AV_FRAME_LOG_EVERY == 0) {
+        CLOG_DEBUG(c, "AV",
+                   "audio recv friend=%u frames=%llu samples=%zu channels=%u rate=%u",
+                   friend_number,
+                   (unsigned long long)c->av_audio_recv_frames,
+                   sample_count, channels, sampling_rate);
+    }
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -422,6 +458,17 @@ static void cb_av_video_receive_frame(ToxAV *av, uint32_t friend_number,
     (void)ustride;
     (void)vstride;
     Carrier *c = (Carrier *)userdata;
+
+    c->av_video_recv_frames++;
+
+    if (c->av_video_recv_frames == 1 ||
+        c->av_video_recv_frames % CARRIER_AV_FRAME_LOG_EVERY == 0) {
+        CLOG_DEBUG(c, "AV",
+                   "video recv friend=%u frames=%llu width=%u height=%u",
+                   friend_number,
+                   (unsigned long long)c->av_video_recv_frames,
+                   (unsigned)width, (unsigned)height);
+    }
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -1075,10 +1122,14 @@ int carrier_send_file(Carrier *c, uint32_t friend_id, const char *path)
                                       &err);
 
     if (err != TOX_ERR_FILE_SEND_OK) {
+        CLOG_WARN(c, "FILE", "send request friend=%u path=%s err=%d",
+                  friend_id, path, (int)err);
         carrier_emit_error(c, "SendFile", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "FILE", "send request friend=%u file=%u size=%ld name=%s",
+              friend_id, file_num, fsize, filename);
     carrier_emit_system(c, "File transfer #%u started: %s", file_num, filename);
     return (int)file_num;
 }
@@ -1096,10 +1147,14 @@ int carrier_accept_file(Carrier *c, uint32_t friend_id, uint32_t file_id,
     tox_file_control(c->tox, friend_id, file_id, TOX_FILE_CONTROL_RESUME, &err);
 
     if (err != TOX_ERR_FILE_CONTROL_OK) {
+        CLOG_WARN(c, "FILE", "control resume friend=%u file=%u err=%d",
+                  friend_id, file_id, (int)err);
         carrier_emit_error(c, "AcceptFile", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "FILE", "control resume friend=%u file=%u",
+              friend_id, file_id);
     return 0;
 }
 
@@ -1113,10 +1168,14 @@ int carrier_cancel_file(Carrier *c, uint32_t friend_id, uint32_t file_id)
     tox_file_control(c->tox, friend_id, file_id, TOX_FILE_CONTROL_CANCEL, &err);
 
     if (err != TOX_ERR_FILE_CONTROL_OK) {
+        CLOG_WARN(c, "FILE", "control cancel friend=%u file=%u err=%d",
+                  friend_id, file_id, (int)err);
         carrier_emit_error(c, "CancelFile", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "FILE", "control cancel friend=%u file=%u",
+              friend_id, file_id);
     return 0;
 }
 
@@ -1140,10 +1199,14 @@ int carrier_create_group(Carrier *c, const char *name, bool is_public)
         (const uint8_t *)name, strlen(name), &err);
 
     if (err != TOX_ERR_GROUP_NEW_OK) {
+        CLOG_WARN(c, "GROUP", "create name=%s public=%s err=%d",
+                  name, is_public ? "true" : "false", (int)err);
         carrier_emit_error(c, "CreateGroup", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "GROUP", "create group=%u name=%s public=%s",
+              group_num, name, is_public ? "true" : "false");
     carrier_emit_system(c, "Group #%u created: %s", group_num, name);
     return (int)group_num;
 }
@@ -1167,6 +1230,7 @@ int carrier_leave_group(Carrier *c, uint32_t group_id)
     }
 
     tox_group_leave(c->tox, group_id, NULL, 0, NULL);
+    CLOG_INFO(c, "GROUP", "leave group=%u", group_id);
     return 0;
 }
 
@@ -1176,15 +1240,19 @@ int carrier_send_group_message(Carrier *c, uint32_t group_id, const char *text)
         return -1;
     }
 
+    size_t bytes = strlen(text);
     Tox_Err_Group_Send_Message err;
     tox_group_send_message(c->tox, group_id, TOX_MESSAGE_TYPE_NORMAL,
-                           (const uint8_t *)text, strlen(text), &err);
+                           (const uint8_t *)text, bytes, &err);
 
     if (err != TOX_ERR_GROUP_SEND_MESSAGE_OK) {
+        CLOG_WARN(c, "GROUP", "send-message group=%u bytes=%zu err=%d",
+                  group_id, bytes, (int)err);
         carrier_emit_error(c, "SendGroupMsg", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_DEBUG(c, "GROUP", "send-message group=%u bytes=%zu", group_id, bytes);
     return 0;
 }
 
@@ -1198,10 +1266,14 @@ int carrier_invite_to_group(Carrier *c, uint32_t group_id, uint32_t friend_id)
     tox_group_invite_friend(c->tox, group_id, friend_id, &err);
 
     if (err != TOX_ERR_GROUP_INVITE_FRIEND_OK) {
+        CLOG_WARN(c, "GROUP", "invite send group=%u friend=%u err=%d",
+                  group_id, friend_id, (int)err);
         carrier_emit_error(c, "InviteToGroup", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "GROUP", "invite send group=%u friend=%u",
+              group_id, friend_id);
     return 0;
 }
 
@@ -1215,14 +1287,21 @@ int carrier_call(Carrier *c, uint32_t friend_id, bool audio, bool video)
         return -1;
     }
 
+    uint32_t audio_br = audio ? 64 : 0;
+    uint32_t video_br = video ? 5000 : 0;
+
     Toxav_Err_Call err;
-    toxav_call(c->av, friend_id, audio ? 64 : 0, video ? 5000 : 0, &err);
+    toxav_call(c->av, friend_id, audio_br, video_br, &err);
 
     if (err != TOXAV_ERR_CALL_OK) {
+        CLOG_WARN(c, "AV", "call send friend=%u audio_br=%u video_br=%u err=%d",
+                  friend_id, audio_br, video_br, (int)err);
         carrier_emit_error(c, "Call", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "AV", "call send friend=%u audio_br=%u video_br=%u",
+              friend_id, audio_br, video_br);
     return 0;
 }
 
@@ -1232,14 +1311,21 @@ int carrier_answer(Carrier *c, uint32_t friend_id, bool audio, bool video)
         return -1;
     }
 
+    uint32_t audio_br = audio ? 64 : 0;
+    uint32_t video_br = video ? 5000 : 0;
+
     Toxav_Err_Answer err;
-    toxav_answer(c->av, friend_id, audio ? 64 : 0, video ? 5000 : 0, &err);
+    toxav_answer(c->av, friend_id, audio_br, video_br, &err);
 
     if (err != TOXAV_ERR_ANSWER_OK) {
+        CLOG_WARN(c, "AV", "answer friend=%u audio_br=%u video_br=%u err=%d",
+                  friend_id, audio_br, video_br, (int)err);
         carrier_emit_error(c, "Answer", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "AV", "answer friend=%u audio_br=%u video_br=%u",
+              friend_id, audio_br, video_br);
     return 0;
 }
 
@@ -1253,10 +1339,12 @@ int carrier_hangup(Carrier *c, uint32_t friend_id)
     toxav_call_control(c->av, friend_id, TOXAV_CALL_CONTROL_CANCEL, &err);
 
     if (err != TOXAV_ERR_CALL_CONTROL_OK) {
+        CLOG_WARN(c, "AV", "hangup friend=%u err=%d", friend_id, (int)err);
         carrier_emit_error(c, "Hangup", "Failed (error %d)", err);
         return -1;
     }
 
+    CLOG_INFO(c, "AV", "hangup friend=%u", friend_id);
     return 0;
 }
 
@@ -1274,6 +1362,17 @@ int carrier_send_audio(Carrier *c, uint32_t friend_id,
 
     if (err != TOXAV_ERR_SEND_FRAME_OK) {
         return -1;
+    }
+
+    c->av_audio_send_frames++;
+
+    if (c->av_audio_send_frames == 1 ||
+        c->av_audio_send_frames % CARRIER_AV_FRAME_LOG_EVERY == 0) {
+        CLOG_DEBUG(c, "AV",
+                   "audio send friend=%u frames=%llu samples=%zu channels=%u rate=%u",
+                   friend_id,
+                   (unsigned long long)c->av_audio_send_frames,
+                   samples, channels, sample_rate);
     }
 
     return 0;
@@ -1294,6 +1393,17 @@ int carrier_send_video(Carrier *c, uint32_t friend_id,
         return -1;
     }
 
+    c->av_video_send_frames++;
+
+    if (c->av_video_send_frames == 1 ||
+        c->av_video_send_frames % CARRIER_AV_FRAME_LOG_EVERY == 0) {
+        CLOG_DEBUG(c, "AV",
+                   "video send friend=%u frames=%llu width=%u height=%u",
+                   friend_id,
+                   (unsigned long long)c->av_video_send_frames,
+                   (unsigned)width, (unsigned)height);
+    }
+
     return 0;
 }
 
@@ -1304,6 +1414,8 @@ int carrier_set_audio_bitrate(Carrier *c, uint32_t friend_id, uint32_t bitrate)
     }
 
     toxav_audio_set_bit_rate(c->av, friend_id, bitrate, NULL);
+    CLOG_INFO(c, "AV", "audio-bitrate friend=%u bitrate=%u",
+              friend_id, bitrate);
     return 0;
 }
 
@@ -1314,6 +1426,8 @@ int carrier_set_video_bitrate(Carrier *c, uint32_t friend_id, uint32_t bitrate)
     }
 
     toxav_video_set_bit_rate(c->av, friend_id, bitrate, NULL);
+    CLOG_INFO(c, "AV", "video-bitrate friend=%u bitrate=%u",
+              friend_id, bitrate);
     return 0;
 }
 

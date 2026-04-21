@@ -55,6 +55,14 @@ struct Carrier {
 
     /* AV state */
     bool   av_initialized;
+
+    /* AV frame counters (rate-limited DEBUG logging: emit every 100th
+     * frame + the first frame of each direction, so [AV] shows call
+     * start and ongoing flow without per-frame spam). */
+    uint64_t av_audio_recv_frames;
+    uint64_t av_video_recv_frames;
+    uint64_t av_audio_send_frames;
+    uint64_t av_video_send_frames;
 };
 
 #endif /* CARRIER_INTERNAL_H */
