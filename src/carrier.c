@@ -239,6 +239,101 @@ static void cb_friend_read_receipt(Tox *tox, uint32_t friend_number,
     carrier_emit(c, &ev);
 }
 
+/* ---------------------------------------------------------------------------
+ * File transfer state-table helpers
+ * ---------------------------------------------------------------------------*/
+
+static int64_t ft_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static struct CarrierTransfer *ft_find(Carrier *c, uint32_t friend_id,
+                                       uint32_t file_id)
+{
+    for (int i = 0; i < CARRIER_MAX_TRANSFERS; i++) {
+        if (c->transfers[i].active &&
+            c->transfers[i].friend_id == friend_id &&
+            c->transfers[i].file_id == file_id) {
+            return &c->transfers[i];
+        }
+    }
+    return NULL;
+}
+
+static struct CarrierTransfer *ft_alloc(Carrier *c)
+{
+    for (int i = 0; i < CARRIER_MAX_TRANSFERS; i++) {
+        if (!c->transfers[i].active) {
+            memset(&c->transfers[i], 0, sizeof(c->transfers[i]));
+            c->transfers[i].active = true;
+            return &c->transfers[i];
+        }
+    }
+    return NULL;
+}
+
+static void ft_release(struct CarrierTransfer *t)
+{
+    if (t == NULL) {
+        return;
+    }
+    if (t->fp != NULL) {
+        fclose(t->fp);
+        t->fp = NULL;
+    }
+    t->active = false;
+    t->state = CARRIER_TRANSFER_NONE;
+    t->position = 0;
+}
+
+/* Progress throttling: emit every 64 KB or every 250 ms, whichever comes first. */
+#define CARRIER_FT_PROGRESS_BYTES   (64u * 1024u)
+#define CARRIER_FT_PROGRESS_MS      250
+
+static void ft_maybe_emit_progress(Carrier *c, struct CarrierTransfer *t,
+                                   bool outbound, bool force)
+{
+    int64_t now = ft_now_ms();
+    uint64_t bytes_delta = t->position - t->last_progress_bytes;
+    int64_t time_delta = now - t->last_progress_ms;
+
+    if (!force && bytes_delta < CARRIER_FT_PROGRESS_BYTES
+        && time_delta < CARRIER_FT_PROGRESS_MS) {
+        return;
+    }
+
+    CarrierEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CARRIER_EVENT_FILE_PROGRESS;
+    ev.file_progress.friend_id = t->friend_id;
+    ev.file_progress.file_id = t->file_id;
+    ev.file_progress.progress = t->file_size > 0
+        ? (double)t->position / (double)t->file_size
+        : 0.0;
+    ev.file_progress.bytes_transferred = t->position;
+    ev.file_progress.outbound = outbound;
+    carrier_emit(c, &ev);
+
+    t->last_progress_bytes = t->position;
+    t->last_progress_ms = now;
+}
+
+static void ft_emit_complete(Carrier *c, struct CarrierTransfer *t,
+                             bool outbound, bool cancelled)
+{
+    CarrierEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CARRIER_EVENT_FILE_COMPLETE;
+    ev.file_complete.friend_id = t->friend_id;
+    ev.file_complete.file_id = t->file_id;
+    ev.file_complete.outbound = outbound;
+    ev.file_complete.cancelled = cancelled;
+    carrier_emit(c, &ev);
+}
+
 static void cb_file_recv(Tox *tox, uint32_t friend_number, uint32_t file_number,
                          uint32_t kind, uint64_t file_size,
                          const uint8_t *filename, size_t filename_length,
@@ -250,6 +345,22 @@ static void cb_file_recv(Tox *tox, uint32_t friend_number, uint32_t file_number,
     CLOG_INFO(c, "FILE", "recv request friend=%u file=%u kind=%u size=%llu name_len=%zu",
               friend_number, file_number, kind,
               (unsigned long long)file_size, filename_length);
+
+    /* Reserve a slot so carrier_accept_file can find metadata by (friend,file). */
+    struct CarrierTransfer *t = ft_alloc(c);
+    if (t != NULL) {
+        t->state = CARRIER_TRANSFER_INBOUND_PENDING;
+        t->friend_id = friend_number;
+        t->file_id = file_number;
+        t->file_size = file_size;
+        size_t n = filename_length < sizeof(t->filename) - 1
+                   ? filename_length : sizeof(t->filename) - 1;
+        memcpy(t->filename, filename, n);
+        t->filename[n] = '\0';
+    } else {
+        CLOG_WARN(c, "FILE", "transfer table full; offer dropped friend=%u file=%u",
+                  friend_number, file_number);
+    }
 
     CarrierEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -264,6 +375,148 @@ static void cb_file_recv(Tox *tox, uint32_t friend_number, uint32_t file_number,
     ev.file_transfer.filename[n] = '\0';
 
     carrier_emit(c, &ev);
+}
+
+static void cb_file_chunk_request(Tox *tox, uint32_t friend_number,
+                                  uint32_t file_number, uint64_t position,
+                                  size_t length, void *userdata)
+{
+    (void)tox;
+    Carrier *c = (Carrier *)userdata;
+
+    struct CarrierTransfer *t = ft_find(c, friend_number, file_number);
+    if (t == NULL || t->fp == NULL) {
+        CLOG_WARN(c, "FILE", "chunk-request for unknown transfer friend=%u file=%u",
+                  friend_number, file_number);
+        return;
+    }
+
+    /* length == 0 → peer finished receiving, transfer complete. */
+    if (length == 0) {
+        CLOG_INFO(c, "FILE", "send complete friend=%u file=%u bytes=%llu",
+                  friend_number, file_number, (unsigned long long)t->position);
+        ft_maybe_emit_progress(c, t, true, true);
+        ft_emit_complete(c, t, true, false);
+        ft_release(t);
+        return;
+    }
+
+    if (fseek(t->fp, (long)position, SEEK_SET) != 0) {
+        CLOG_ERROR(c, "FILE", "fseek failed friend=%u file=%u pos=%llu",
+                   friend_number, file_number, (unsigned long long)position);
+        return;
+    }
+
+    uint8_t *buf = malloc(length);
+    if (buf == NULL) {
+        return;
+    }
+
+    size_t n = fread(buf, 1, length, t->fp);
+    if (n == 0 && ferror(t->fp)) {
+        CLOG_ERROR(c, "FILE", "fread failed friend=%u file=%u",
+                   friend_number, file_number);
+        free(buf);
+        return;
+    }
+
+    Tox_Err_File_Send_Chunk err;
+    tox_file_send_chunk(c->tox, friend_number, file_number, position,
+                        buf, n, &err);
+    free(buf);
+
+    if (err != TOX_ERR_FILE_SEND_CHUNK_OK) {
+        CLOG_WARN(c, "FILE", "send-chunk failed friend=%u file=%u err=%d",
+                  friend_number, file_number, (int)err);
+        return;
+    }
+
+    t->state = CARRIER_TRANSFER_OUTBOUND_ACTIVE;
+    t->position = position + n;
+    ft_maybe_emit_progress(c, t, true, false);
+}
+
+static void cb_file_recv_chunk(Tox *tox, uint32_t friend_number,
+                               uint32_t file_number, uint64_t position,
+                               const uint8_t *data, size_t length, void *userdata)
+{
+    (void)tox;
+    Carrier *c = (Carrier *)userdata;
+
+    struct CarrierTransfer *t = ft_find(c, friend_number, file_number);
+    if (t == NULL) {
+        return;
+    }
+
+    /* length == 0 → EOF marker, transfer complete. */
+    if (length == 0) {
+        CLOG_INFO(c, "FILE", "recv complete friend=%u file=%u bytes=%llu",
+                  friend_number, file_number, (unsigned long long)t->position);
+        ft_maybe_emit_progress(c, t, false, true);
+        ft_emit_complete(c, t, false, false);
+        ft_release(t);
+        return;
+    }
+
+    if (t->fp == NULL) {
+        /* Offer hasn't been accepted yet — silently drop (shouldn't happen
+         * since Tox waits for RESUME, but be defensive). */
+        return;
+    }
+
+    if (fseek(t->fp, (long)position, SEEK_SET) != 0) {
+        CLOG_ERROR(c, "FILE", "recv fseek failed friend=%u file=%u pos=%llu",
+                   friend_number, file_number, (unsigned long long)position);
+        return;
+    }
+
+    if (fwrite(data, 1, length, t->fp) != length) {
+        CLOG_ERROR(c, "FILE", "recv fwrite failed friend=%u file=%u",
+                   friend_number, file_number);
+        return;
+    }
+
+    t->state = CARRIER_TRANSFER_INBOUND_ACTIVE;
+    t->position = position + length;
+    ft_maybe_emit_progress(c, t, false, false);
+}
+
+static void cb_file_recv_control(Tox *tox, uint32_t friend_number,
+                                 uint32_t file_number, Tox_File_Control control,
+                                 void *userdata)
+{
+    (void)tox;
+    Carrier *c = (Carrier *)userdata;
+
+    struct CarrierTransfer *t = ft_find(c, friend_number, file_number);
+    if (t == NULL) {
+        CLOG_DEBUG(c, "FILE", "recv-control for unknown transfer friend=%u file=%u ctrl=%d",
+                   friend_number, file_number, (int)control);
+        return;
+    }
+
+    bool outbound = (t->state == CARRIER_TRANSFER_OUTBOUND_PENDING
+                  || t->state == CARRIER_TRANSFER_OUTBOUND_ACTIVE);
+
+    switch (control) {
+        case TOX_FILE_CONTROL_RESUME:
+            CLOG_INFO(c, "FILE", "recv-control RESUME friend=%u file=%u",
+                      friend_number, file_number);
+            if (outbound) {
+                t->state = CARRIER_TRANSFER_OUTBOUND_ACTIVE;
+            }
+            break;
+        case TOX_FILE_CONTROL_PAUSE:
+            CLOG_INFO(c, "FILE", "recv-control PAUSE friend=%u file=%u",
+                      friend_number, file_number);
+            break;
+        case TOX_FILE_CONTROL_CANCEL:
+            CLOG_INFO(c, "FILE", "recv-control CANCEL friend=%u file=%u",
+                      friend_number, file_number);
+            ft_emit_complete(c, t, outbound, true);
+            ft_release(t);
+            break;
+    }
 }
 
 /* Group callbacks */
@@ -559,6 +812,9 @@ static void register_callbacks(Carrier *c)
     tox_callback_friend_status_message(c->tox, cb_friend_status_message);
     tox_callback_friend_read_receipt(c->tox, cb_friend_read_receipt);
     tox_callback_file_recv(c->tox, cb_file_recv);
+    tox_callback_file_chunk_request(c->tox, cb_file_chunk_request);
+    tox_callback_file_recv_chunk(c->tox, cb_file_recv_chunk);
+    tox_callback_file_recv_control(c->tox, cb_file_recv_control);
     tox_callback_group_message(c->tox, cb_group_message);
     tox_callback_group_invite(c->tox, cb_group_invite);
     tox_callback_group_peer_join(c->tox, cb_group_peer_join);
@@ -796,6 +1052,15 @@ void carrier_free(Carrier *c)
     }
 
     carrier_save(c);
+
+    /* Close any open file handles from in-flight transfers. */
+    for (int i = 0; i < CARRIER_MAX_TRANSFERS; i++) {
+        if (c->transfers[i].active && c->transfers[i].fp != NULL) {
+            fclose(c->transfers[i].fp);
+            c->transfers[i].fp = NULL;
+            c->transfers[i].active = false;
+        }
+    }
 
     if (c->av != NULL) {
         toxav_kill(c->av);
@@ -1110,6 +1375,19 @@ int carrier_send_file(Carrier *c, uint32_t friend_id, const char *path)
         return -1;
     }
 
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        carrier_emit_error(c, "SendFile", "Cannot open file: %s", path);
+        return -1;
+    }
+
+    struct CarrierTransfer *t = ft_alloc(c);
+    if (t == NULL) {
+        fclose(fp);
+        carrier_emit_error(c, "SendFile", "Transfer table full");
+        return -1;
+    }
+
     /* Extract filename from path */
     const char *filename = strrchr(path, '/');
     filename = filename ? filename + 1 : path;
@@ -1122,24 +1400,58 @@ int carrier_send_file(Carrier *c, uint32_t friend_id, const char *path)
                                       &err);
 
     if (err != TOX_ERR_FILE_SEND_OK) {
+        fclose(fp);
+        t->active = false;
         CLOG_WARN(c, "FILE", "send request friend=%u path=%s err=%d",
                   friend_id, path, (int)err);
         carrier_emit_error(c, "SendFile", "Failed (error %d)", err);
         return -1;
     }
 
+    t->state = CARRIER_TRANSFER_OUTBOUND_PENDING;
+    t->friend_id = friend_id;
+    t->file_id = file_num;
+    t->file_size = (uint64_t)fsize;
+    t->fp = fp;
+    snprintf(t->path, sizeof(t->path), "%s", path);
+    snprintf(t->filename, sizeof(t->filename), "%s", filename);
+    t->last_progress_ms = ft_now_ms();
+
     CLOG_INFO(c, "FILE", "send request friend=%u file=%u size=%ld name=%s",
               friend_id, file_num, fsize, filename);
-    carrier_emit_system(c, "File transfer #%u started: %s", file_num, filename);
+
+    /* Emit a correlation event so the pipeline can map path → fileId. */
+    CarrierEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CARRIER_EVENT_FILE_SEND_STARTED;
+    ev.file_send_started.friend_id = friend_id;
+    ev.file_send_started.file_id = file_num;
+    ev.file_send_started.file_size = (uint64_t)fsize;
+    snprintf(ev.file_send_started.filename, sizeof(ev.file_send_started.filename),
+             "%s", filename);
+    carrier_emit(c, &ev);
+
     return (int)file_num;
 }
 
 int carrier_accept_file(Carrier *c, uint32_t friend_id, uint32_t file_id,
                         const char *save_path)
 {
-    (void)save_path;  /* TODO: implement file recv with save path */
+    if (c == NULL || save_path == NULL) {
+        return -1;
+    }
 
-    if (c == NULL) {
+    struct CarrierTransfer *t = ft_find(c, friend_id, file_id);
+    if (t == NULL || t->state != CARRIER_TRANSFER_INBOUND_PENDING) {
+        carrier_emit_error(c, "AcceptFile",
+                           "No pending inbound transfer friend=%u file=%u",
+                           friend_id, file_id);
+        return -1;
+    }
+
+    FILE *fp = fopen(save_path, "wb");
+    if (fp == NULL) {
+        carrier_emit_error(c, "AcceptFile", "Cannot open for write: %s", save_path);
         return -1;
     }
 
@@ -1147,14 +1459,20 @@ int carrier_accept_file(Carrier *c, uint32_t friend_id, uint32_t file_id,
     tox_file_control(c->tox, friend_id, file_id, TOX_FILE_CONTROL_RESUME, &err);
 
     if (err != TOX_ERR_FILE_CONTROL_OK) {
+        fclose(fp);
         CLOG_WARN(c, "FILE", "control resume friend=%u file=%u err=%d",
                   friend_id, file_id, (int)err);
         carrier_emit_error(c, "AcceptFile", "Failed (error %d)", err);
         return -1;
     }
 
-    CLOG_INFO(c, "FILE", "control resume friend=%u file=%u",
-              friend_id, file_id);
+    t->state = CARRIER_TRANSFER_INBOUND_ACTIVE;
+    t->fp = fp;
+    snprintf(t->path, sizeof(t->path), "%s", save_path);
+    t->last_progress_ms = ft_now_ms();
+
+    CLOG_INFO(c, "FILE", "control resume friend=%u file=%u save=%s",
+              friend_id, file_id, save_path);
     return 0;
 }
 
@@ -1172,6 +1490,14 @@ int carrier_cancel_file(Carrier *c, uint32_t friend_id, uint32_t file_id)
                   friend_id, file_id, (int)err);
         carrier_emit_error(c, "CancelFile", "Failed (error %d)", err);
         return -1;
+    }
+
+    struct CarrierTransfer *t = ft_find(c, friend_id, file_id);
+    if (t != NULL) {
+        bool outbound = (t->state == CARRIER_TRANSFER_OUTBOUND_PENDING
+                      || t->state == CARRIER_TRANSFER_OUTBOUND_ACTIVE);
+        ft_emit_complete(c, t, outbound, true);
+        ft_release(t);
     }
 
     CLOG_INFO(c, "FILE", "control cancel friend=%u file=%u",

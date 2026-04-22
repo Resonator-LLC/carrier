@@ -315,23 +315,43 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt,
         return carrier_send_group_message(c, gid, raw_turtle);
     }
 
-    if (strcmp(stmt->type, "FileTransfer") == 0) {
+    if (strcmp(stmt->type, "SendFile") == 0) {
         uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
         const char *path = find_pred(stmt, "path");
 
         if (fid == UINT32_MAX || path == NULL) {
-            carrier_emit_error(c, "FileTransfer", "Missing carrier:friendId or carrier:path");
+            carrier_emit_error(c, "SendFile", "Missing carrier:friendId or carrier:path");
             return -1;
         }
 
         return carrier_send_file(c, fid, path);
     }
 
-    if (strcmp(stmt->type, "FileAccept") == 0) {
+    if (strcmp(stmt->type, "AcceptFile") == 0) {
         uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
         uint32_t file_id = find_pred_uint(stmt, "fileId", UINT32_MAX);
         const char *path = find_pred(stmt, "path");
+
+        if (fid == UINT32_MAX || file_id == UINT32_MAX || path == NULL) {
+            carrier_emit_error(c, "AcceptFile",
+                               "Missing carrier:friendId/fileId/path");
+            return -1;
+        }
+
         return carrier_accept_file(c, fid, file_id, path);
+    }
+
+    if (strcmp(stmt->type, "CancelFile") == 0) {
+        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
+        uint32_t file_id = find_pred_uint(stmt, "fileId", UINT32_MAX);
+
+        if (fid == UINT32_MAX || file_id == UINT32_MAX) {
+            carrier_emit_error(c, "CancelFile",
+                               "Missing carrier:friendId or carrier:fileId");
+            return -1;
+        }
+
+        return carrier_cancel_file(c, fid, file_id);
     }
 
     if (strcmp(stmt->type, "Group") == 0) {

@@ -11,17 +11,43 @@
 
 #include "carrier.h"
 
+#include <stdio.h>
+
 #include <tox/tox.h>
 #include <tox/toxav.h>
 #include <tox/toxencryptsave.h>
 
 #define CARRIER_MAX_FRIEND_REQUESTS 64
 #define CARRIER_MAX_PASSWORD_LEN    64
+#define CARRIER_MAX_TRANSFERS       32
+#define CARRIER_MAX_PATH_LEN        512
 
 struct CarrierFriendRequest {
     bool     active;
     uint8_t  public_key[TOX_PUBLIC_KEY_SIZE];
     char     message[TOX_MAX_FRIEND_REQUEST_LENGTH + 1];
+};
+
+typedef enum {
+    CARRIER_TRANSFER_NONE = 0,
+    CARRIER_TRANSFER_OUTBOUND_PENDING,   /* offer sent, awaiting RESUME */
+    CARRIER_TRANSFER_OUTBOUND_ACTIVE,    /* sending chunks */
+    CARRIER_TRANSFER_INBOUND_PENDING,    /* offer received, awaiting accept */
+    CARRIER_TRANSFER_INBOUND_ACTIVE,     /* receiving chunks */
+} CarrierTransferState;
+
+struct CarrierTransfer {
+    bool                  active;
+    CarrierTransferState  state;
+    uint32_t              friend_id;
+    uint32_t              file_id;
+    uint64_t              file_size;
+    uint64_t              position;        /* bytes transferred so far */
+    FILE                 *fp;              /* open handle for the duration of transfer */
+    char                  path[CARRIER_MAX_PATH_LEN];
+    char                  filename[CARRIER_MAX_NAME_LENGTH];
+    uint64_t              last_progress_bytes; /* throttle progress events */
+    int64_t               last_progress_ms;
 };
 
 struct Carrier {
@@ -40,6 +66,9 @@ struct Carrier {
     /* Friend requests */
     struct CarrierFriendRequest friend_requests[CARRIER_MAX_FRIEND_REQUESTS];
     int    num_friend_requests;
+
+    /* File transfers */
+    struct CarrierTransfer transfers[CARRIER_MAX_TRANSFERS];
 
     /* Event callback */
     carrier_event_cb event_cb;

@@ -326,15 +326,27 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fprintf(out, "\"");
             break;
 
+        case CARRIER_EVENT_FILE_SEND_STARTED:
+            fprintf(out, "[] a carrier:SendFileStarted ; carrier:friendId %u ; carrier:fileId %u ; carrier:size %lu ; carrier:filename \"",
+                    ev->file_send_started.friend_id, ev->file_send_started.file_id,
+                    (unsigned long)ev->file_send_started.file_size);
+            turtle_escape(out, ev->file_send_started.filename);
+            fprintf(out, "\"");
+            break;
+
         case CARRIER_EVENT_FILE_PROGRESS:
-            fprintf(out, "[] a carrier:FileProgress ; carrier:friendId %u ; carrier:fileId %u ; carrier:progress %.4f",
+            fprintf(out, "[] a carrier:FileProgress ; carrier:friendId %u ; carrier:fileId %u ; carrier:progress %.4f ; carrier:bytesTransferred %lu ; carrier:direction \"%s\"",
                     ev->file_progress.friend_id, ev->file_progress.file_id,
-                    ev->file_progress.progress);
+                    ev->file_progress.progress,
+                    (unsigned long)ev->file_progress.bytes_transferred,
+                    ev->file_progress.outbound ? "out" : "in");
             break;
 
         case CARRIER_EVENT_FILE_COMPLETE:
-            fprintf(out, "[] a carrier:FileComplete ; carrier:friendId %u ; carrier:fileId %u",
-                    ev->file_complete.friend_id, ev->file_complete.file_id);
+            fprintf(out, "[] a carrier:FileComplete ; carrier:friendId %u ; carrier:fileId %u ; carrier:direction \"%s\" ; carrier:cancelled %s",
+                    ev->file_complete.friend_id, ev->file_complete.file_id,
+                    ev->file_complete.outbound ? "out" : "in",
+                    ev->file_complete.cancelled ? "true" : "false");
             break;
 
         case CARRIER_EVENT_CALL:

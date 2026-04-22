@@ -51,6 +51,7 @@ typedef enum {
     CARRIER_EVENT_CONFERENCE_MESSAGE,
     CARRIER_EVENT_CONFERENCE_INVITE,
     CARRIER_EVENT_FILE_TRANSFER,
+    CARRIER_EVENT_FILE_SEND_STARTED,
     CARRIER_EVENT_FILE_PROGRESS,
     CARRIER_EVENT_FILE_COMPLETE,
     CARRIER_EVENT_CALL,
@@ -156,12 +157,23 @@ typedef struct {
         struct {
             uint32_t friend_id;
             uint32_t file_id;
+            uint64_t file_size;
+            char filename[CARRIER_MAX_NAME_LENGTH];
+        } file_send_started;
+
+        struct {
+            uint32_t friend_id;
+            uint32_t file_id;
             double progress;
+            uint64_t bytes_transferred;
+            bool outbound;
         } file_progress;
 
         struct {
             uint32_t friend_id;
             uint32_t file_id;
+            bool outbound;
+            bool cancelled;
         } file_complete;
 
         struct {
