@@ -14,6 +14,7 @@
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
 #include <jami/conversation_interface.h>
+#include <jami/datatransfer_interface.h>
 #include <jami/presencemanager_interface.h>
 
 #include <cerrno>
@@ -672,4 +673,59 @@ extern "C" int carrier_subscribe_presence(Carrier    *c,
      * is a no-op aside from a fresh notification. */
     libjami::subscribeBuddy(account_id, contact_uri, subscribe);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * File transfer
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_send_file(Carrier    *c,
+                                 const char *account_id,
+                                 const char *conversation_id,
+                                 const char *path,
+                                 const char *display_name)
+{
+    if (!c || !account_id || !conversation_id || !path) {
+        return -1;
+    }
+    /* libjami::sendFile is void noexcept — it dispatches the sha3 hash and
+     * commit to a computation thread, then a callback writes the file
+     * symlink into conversation_data/. Path validation (regular file,
+     * readable size) happens inside JamiAccount::sendFile and surfaces via
+     * OnConversationError, which we don't currently bind — a missing file
+     * fails silently aside from libjami's own log. Acceptable for M4a;
+     * revisit if a consumer needs synchronous validation. */
+    const std::string name = (display_name && *display_name) ? display_name : "";
+    libjami::sendFile(account_id, conversation_id, path, name, /*replyTo=*/"");
+    return 0;
+}
+
+extern "C" int carrier_accept_file(Carrier    *c,
+                                   const char *account_id,
+                                   const char *conversation_id,
+                                   const char *message_id,
+                                   const char *file_id,
+                                   const char *path)
+{
+    if (!c || !account_id || !conversation_id || !message_id || !file_id || !path) {
+        return -1;
+    }
+    /* libjami::downloadFile is bool noexcept; false signals invalid args
+     * (unknown conversation/file or io failure preparing the destination).
+     * The asynchronous transfer surfaces via DataTransferEvent thereafter. */
+    const bool ok = libjami::downloadFile(account_id, conversation_id,
+                                          message_id, file_id, path);
+    return ok ? 0 : -1;
+}
+
+extern "C" int carrier_cancel_file(Carrier    *c,
+                                   const char *account_id,
+                                   const char *conversation_id,
+                                   const char *file_id)
+{
+    if (!c || !account_id || !conversation_id || !file_id) {
+        return -1;
+    }
+    const auto err = libjami::cancelDataTransfer(account_id, conversation_id, file_id);
+    return (err == libjami::DataTransferError::success) ? 0 : -1;
 }

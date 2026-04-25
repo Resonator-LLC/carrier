@@ -9,13 +9,17 @@
  *  under the MIT License.
  */
 
+#include "carrier_events.h"
 #include "carrier_internal.hpp"
 
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
 #include <jami/conversation_interface.h>
+#include <jami/datatransfer_interface.h>
 #include <jami/presencemanager_interface.h>
 
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -237,6 +241,54 @@ void on_swarm_message_received(Carrier *c,
                                const std::string &conversationId,
                                const libjami::SwarmMessage &message)
 {
+    auto get = [&](const char *key) -> std::string {
+        auto it = message.body.find(key);
+        return it == message.body.end() ? std::string{} : it->second;
+    };
+
+    /* File-transfer offers: a Swarm commit of type
+     * `application/data-transfer+json`. libjami's ConversationRepository
+     * enriches the body map with `fileId` (computed from commitId + tid +
+     * displayName) before the signal fires, so all the metadata the
+     * receiver needs is on the wire. Author identifies the sender; the
+     * commit id (== libjami's interactionId for downloadFile) lives in
+     * message.id. */
+    if (message.type == "application/data-transfer+json") {
+        const std::string author      = get("author");
+        const std::string display     = get("displayName");
+        const std::string total_str   = get("totalSize");
+        const std::string file_id     = get("fileId");
+
+        /* Skip our own offers echoed back via Swarm sync. */
+        {
+            std::lock_guard<std::mutex> lock(c->accounts_mtx);
+            auto it = c->accounts.find(accountId);
+            if (it != c->accounts.end() && !it->second.self_uri.empty() &&
+                author == it->second.self_uri) {
+                return;
+            }
+        }
+
+        std::uint64_t total = 0;
+        if (!total_str.empty()) {
+            total = std::strtoull(total_str.c_str(), nullptr, 10);
+        }
+
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_FILE_RECV);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.file_recv.conversation_id,
+                   CARRIER_CONVERSATION_ID_LEN, conversationId);
+        copy_fixed(qe.ev.file_recv.contact_uri, CARRIER_URI_LEN, author);
+        copy_fixed(qe.ev.file_recv.message_id,
+                   CARRIER_MESSAGE_ID_LEN, message.id);
+        copy_fixed(qe.ev.file_recv.file_id, CARRIER_FILE_ID_LEN, file_id);
+        copy_fixed(qe.ev.file_recv.filename, CARRIER_NAME_LEN, display);
+        qe.ev.file_recv.size = total;
+        carrier_push_event(c, std::move(qe));
+        return;
+    }
+
     /* Only surface text messages here. Other commit types (member events
      * fire ConversationMemberEvent separately; profile updates and
      * reactions stay internal until they have a typed event in M4). */
@@ -244,14 +296,8 @@ void on_swarm_message_received(Carrier *c,
         return;
     }
 
-    std::string from;
-    std::string body;
-    if (auto it = message.body.find("author"); it != message.body.end()) {
-        from = it->second;
-    }
-    if (auto it = message.body.find("body"); it != message.body.end()) {
-        body = it->second;
-    }
+    const std::string from = get("author");
+    std::string body       = get("body");
 
     /* Skip our own messages echoed back via Swarm sync. */
     {
@@ -495,6 +541,89 @@ void on_presence_changed(Carrier *c,
     carrier_push_event(c, std::move(qe));
 }
 
+/* ---------------------------------------------------------------------------
+ * DataTransferEvent handler
+ *
+ * libjami fires this for both directions of a Swarm file transfer. Code
+ * mapping:
+ *   created/wait_*       — sender-local bookkeeping (fileId is sometimes
+ *                          a local path, not a real id) → suppress.
+ *   ongoing              → FILE_PROGRESS (single-shot per direction;
+ *                          incoming side only — outgoing never fires this).
+ *   finished/closed_*    → FILE_COMPLETE with the matching status string.
+ *   invalid/unsupported/ → carrier:Error with class "FileTransfer".
+ *   invalid_pathname/
+ *   unjoinable_peer/
+ *   timeout_expired
+ * ---------------------------------------------------------------------------*/
+
+void on_data_transfer_event(Carrier *c,
+                            const std::string &accountId,
+                            const std::string &conversationId,
+                            const std::string &/*interactionId*/,
+                            const std::string &fileId,
+                            int eventCode)
+{
+    using DC = libjami::DataTransferEventCode;
+    const DC code = static_cast<DC>(eventCode);
+
+    switch (code) {
+        case DC::invalid:
+        case DC::unsupported:
+        case DC::created:
+        case DC::wait_peer_acceptance:
+        case DC::wait_host_acceptance:
+            /* Suppress: invalid/unsupported are noise for ids the daemon
+             * synthesizes during sender-local bookkeeping; created carries
+             * fileId=path on the sender side; wait_* are intermediate
+             * states the embedder doesn't need to track. */
+            return;
+
+        case DC::ongoing: {
+            QueuedEvent qe;
+            stamp(qe.ev, CARRIER_EVENT_FILE_PROGRESS);
+            set_account(qe.ev, accountId);
+            copy_fixed(qe.ev.file_progress.conversation_id,
+                       CARRIER_CONVERSATION_ID_LEN, conversationId);
+            copy_fixed(qe.ev.file_progress.file_id, CARRIER_FILE_ID_LEN, fileId);
+            carrier_push_event(c, std::move(qe));
+            return;
+        }
+
+        case DC::finished:
+        case DC::closed_by_host:
+        case DC::closed_by_peer: {
+            const char *status =
+                (code == DC::finished)        ? "finished" :
+                (code == DC::closed_by_host)  ? "closed_by_host" :
+                                                "closed_by_peer";
+            QueuedEvent qe;
+            stamp(qe.ev, CARRIER_EVENT_FILE_COMPLETE);
+            set_account(qe.ev, accountId);
+            copy_fixed(qe.ev.file_complete.conversation_id,
+                       CARRIER_CONVERSATION_ID_LEN, conversationId);
+            copy_fixed(qe.ev.file_complete.file_id, CARRIER_FILE_ID_LEN, fileId);
+            copy_fixed(qe.ev.file_complete.status, CARRIER_STATUS_LEN, status);
+            carrier_push_event(c, std::move(qe));
+            return;
+        }
+
+        case DC::invalid_pathname:
+        case DC::unjoinable_peer:
+        case DC::timeout_expired:
+            carrier_emit_error(c, "FileTransfer", "FileTransfer",
+                               "transfer %s failed: code=%d (conv=%s)",
+                               fileId.c_str(), eventCode,
+                               conversationId.c_str());
+            return;
+    }
+    /* Unknown future enum value: log via carrier_emit_error so it's not
+     * silently swallowed. */
+    carrier_emit_error(c, "FileTransfer", "FileTransfer",
+                       "transfer %s unknown DataTransferEventCode=%d",
+                       fileId.c_str(), eventCode);
+}
+
 } /* anonymous namespace */
 
 /* ---------------------------------------------------------------------------
@@ -509,6 +638,7 @@ void carrier_register_signals(Carrier *c)
     using CS  = libjami::ConfigurationSignal;
     using VS  = libjami::ConversationSignal;
     using PS  = libjami::PresenceSignal;
+    using DTS = libjami::DataTransferSignal;
 
     handlers.insert(exportable_callback<CS::RegistrationStateChanged>(
         [c](const std::string &accountId, const std::string &state,
@@ -578,6 +708,14 @@ void carrier_register_signals(Carrier *c)
         [c](const std::string &accountId, const std::string &buddyUri,
             int status, const std::string &lineStatus) {
             on_presence_changed(c, accountId, buddyUri, status, lineStatus);
+        }));
+
+    handlers.insert(exportable_callback<DTS::DataTransferEvent>(
+        [c](const std::string &accountId, const std::string &conversationId,
+            const std::string &interactionId, const std::string &fileId,
+            int eventCode) {
+            on_data_transfer_event(c, accountId, conversationId,
+                                   interactionId, fileId, eventCode);
         }));
 
     libjami::registerSignalHandlers(handlers);

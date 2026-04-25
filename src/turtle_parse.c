@@ -392,6 +392,61 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- File transfer --- */
+
+    if (strcmp(stmt->type, "SendFile") == 0) {
+        const char *account = require_account(c, stmt, "SendFile");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *path = find_pred(stmt, "path");
+        if (!conv || !path) {
+            carrier_emit_error(c, "SendFile", "MissingField",
+                               "carrier:conversationId and carrier:path required");
+            return 0;
+        }
+        const char *display = find_pred(stmt, "filename");
+        if (!display) display = find_pred(stmt, "displayName");
+        carrier_send_file(c, account, conv, path, display);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "AcceptFile") == 0) {
+        const char *account = require_account(c, stmt, "AcceptFile");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *msg  = find_pred(stmt, "messageId");
+        const char *fid  = find_pred(stmt, "fileId");
+        const char *path = find_pred(stmt, "path");
+        if (!conv || !msg || !fid || !path) {
+            carrier_emit_error(c, "AcceptFile", "MissingField",
+                               "carrier:conversationId, carrier:messageId, "
+                               "carrier:fileId, and carrier:path required");
+            return 0;
+        }
+        if (carrier_accept_file(c, account, conv, msg, fid, path) != 0) {
+            carrier_emit_error(c, "AcceptFile", "LibjamiFailure",
+                               "downloadFile rejected (unknown id or io error)");
+        }
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "CancelFile") == 0) {
+        const char *account = require_account(c, stmt, "CancelFile");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *fid  = find_pred(stmt, "fileId");
+        if (!conv || !fid) {
+            carrier_emit_error(c, "CancelFile", "MissingField",
+                               "carrier:conversationId and carrier:fileId required");
+            return 0;
+        }
+        if (carrier_cancel_file(c, account, conv, fid) != 0) {
+            carrier_emit_error(c, "CancelFile", "LibjamiFailure",
+                               "cancelDataTransfer rejected (unknown id)");
+        }
+        return 0;
+    }
+
     /* --- Presence --- */
 
     if (strcmp(stmt->type, "SubscribePresence") == 0 ||

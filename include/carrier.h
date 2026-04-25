@@ -16,10 +16,12 @@
  *  Scope as of M4a (this header): lifecycle, account creation/loading,
  *  self-ID, trust requests, 1:1 text messaging, multi-party Swarm
  *  conversations (create, send, accept/decline invitation, invite member,
- *  remove), reactions, continuous presence, device linking, and Swarm file
- *  transfers. Calls (audio/video) deferred to M4b. Functions and event
- *  types are added in later milestones as they land — there are no
- *  forward-declared placeholders for unimplemented surface.
+ *  remove), reactions, continuous presence, and Swarm file transfers
+ *  (offer/accept/cancel via DataTransferSignal::DataTransferEvent and
+ *  inbound `application/data-transfer+json` commits). Device linking and
+ *  calls (audio/video) deferred to later milestones. Functions and event
+ *  types are added as they land — there are no forward-declared
+ *  placeholders for unimplemented surface.
  *
  *  v3.2 break (M4a): `message_id` is now a 40-hex Swarm commit hash
  *  (`char[CARRIER_MESSAGE_ID_LEN]`) on every event that carries one,
@@ -71,9 +73,11 @@ typedef struct Carrier Carrier;
 #define CARRIER_ACCOUNT_ID_LEN        64  /* libjami internal account handle */
 #define CARRIER_CONVERSATION_ID_LEN   64  /* Swarm commit hash (40 hex) + headroom */
 #define CARRIER_MESSAGE_ID_LEN        64  /* Swarm message commit hash (40 hex) + headroom */
-#define CARRIER_NAME_LEN             128  /* display name */
+#define CARRIER_NAME_LEN             128  /* display name (also used for file display name) */
 #define CARRIER_REACTION_LEN          32  /* emoji grapheme cluster, generous cap */
 #define CARRIER_STATUS_LEN            16  /* presence status string ("online", "offline", ...) */
+#define CARRIER_FILE_ID_LEN           96  /* "<40hex>_<digits>[.<ext>]" file identifier */
+#define CARRIER_PATH_LEN            1024  /* file system path */
 
 /* ---------------------------------------------------------------------------
  * Event types
@@ -100,6 +104,9 @@ typedef enum {
     CARRIER_EVENT_SWARM_COMMIT,             /* raw Swarm git commit (DAG-level view) */
     CARRIER_EVENT_REACTION,                 /* peer reacted to a Swarm message (M4) */
     CARRIER_EVENT_PRESENCE,                 /* continuous presence update for a contact */
+    CARRIER_EVENT_FILE_RECV,                /* incoming file-transfer offer in a Swarm */
+    CARRIER_EVENT_FILE_PROGRESS,            /* file transfer started (per-direction, single-shot) */
+    CARRIER_EVENT_FILE_COMPLETE,            /* file transfer reached terminal state */
     CARRIER_EVENT_ERROR,                    /* command-level failure */
     CARRIER_EVENT_SYSTEM,                   /* operational notice */
 } CarrierEventType;
@@ -258,6 +265,43 @@ typedef struct {
             char contact_uri[CARRIER_URI_LEN];
             char status[CARRIER_STATUS_LEN];
         } presence;
+
+        /* Inbound file-transfer offer. Surfaced from a Swarm commit of
+         * type `application/data-transfer+json` — the body carries the
+         * file metadata and libjami enriches it with the canonical
+         * fileId (`<commitId>_<tid>[.<ext>]`). The receiver must call
+         * carrier_accept_file with `message_id` + `file_id` to actually
+         * download; without that, the offer remains pending in the Swarm
+         * but no bytes flow. */
+        struct {
+            char     conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char     contact_uri[CARRIER_URI_LEN];      /* sender */
+            char     message_id[CARRIER_MESSAGE_ID_LEN];/* offer commit id (= libjami interactionId) */
+            char     file_id[CARRIER_FILE_ID_LEN];
+            char     filename[CARRIER_NAME_LEN];        /* libjami displayName */
+            uint64_t size;                              /* totalSize bytes (from offer) */
+        } file_recv;
+
+        /* Transfer-started signal. libjami emits at most one of these
+         * per direction per transfer (incoming side only); outgoing
+         * transfers do not surface a progress tick — their first user-
+         * visible event is FILE_COMPLETE. Consumers that want fine-grained
+         * progress must keep their own tick or extend the shim later. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char file_id[CARRIER_FILE_ID_LEN];
+        } file_progress;
+
+        /* Terminal state for a file transfer. `status` collapses libjami's
+         * DataTransferEventCode into one of: "finished", "closed_by_host",
+         * "closed_by_peer". True errors (invalid path, unjoinable peer,
+         * timeout) are surfaced via CARRIER_EVENT_ERROR with class
+         * "FileTransfer", not here. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char file_id[CARRIER_FILE_ID_LEN];
+            char status[CARRIER_STATUS_LEN];
+        } file_complete;
 
         /* A command was rejected. `command` is the RDF local name (e.g.
          * "SendTrustRequest") when triaged at the dispatch layer; otherwise
@@ -680,6 +724,85 @@ int carrier_subscribe_presence(Carrier    *c,
                                const char *account_id,
                                const char *contact_uri,
                                bool        subscribe);
+
+/* ---------------------------------------------------------------------------
+ * File transfer
+ *
+ * Files ride on Jami's Swarm DAG: the sender posts an
+ * `application/data-transfer+json` commit (offer) and libjami serves the
+ * file contents over a separate Swarm channel once a peer asks for them.
+ * The receiver sees the offer as CARRIER_EVENT_FILE_RECV and chooses
+ * whether to accept; carrier_accept_file then triggers libjami's
+ * downloadFile and bytes start flowing. No auto-download — the embedder
+ * decides destination paths.
+ *
+ * Lifecycle (sender):
+ *   1. carrier_send_file with a local source path. Returns 0 on enqueue.
+ *      libjami sha3-hashes the file off-thread, then commits the offer.
+ *   2. When the peer pulls the file, FILE_COMPLETE fires with
+ *      status="finished" (success), "closed_by_peer" (peer cancelled),
+ *      or "closed_by_host" (we cancelled).
+ *
+ * Lifecycle (receiver):
+ *   1. FILE_RECV arrives carrying file_id, message_id (the offer commit),
+ *      filename, size, and the sender's contact_uri.
+ *   2. To accept: carrier_accept_file(account, conv, message_id, file_id,
+ *      destination_path). FILE_PROGRESS fires once when the download
+ *      starts; FILE_COMPLETE fires with the terminal status when it ends.
+ *   3. To decline: do nothing (or carrier_cancel_file to free local state).
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Offer a local file as a Swarm attachment in `conversation_id`.
+ *
+ * path:         absolute path to a regular file the sender owns. libjami
+ *               reads it lazily as the peer pulls; the file must remain
+ *               readable for the lifetime of the transfer.
+ * display_name: name shown to the peer in FILE_RECV.filename. NULL or ""
+ *               falls back to basename(path).
+ *
+ * Returns 0 on enqueue (the actual commit is async — sha3sum runs on a
+ * computation thread). Returns -1 on validation failure (NULL args).
+ * libjami signals path-not-found via OnConversationError, surfaced as a
+ * carrier:Error with class="FileTransfer".
+ */
+int carrier_send_file(Carrier    *c,
+                      const char *account_id,
+                      const char *conversation_id,
+                      const char *path,
+                      const char *display_name);
+
+/*
+ * Accept an inbound file offer. Triggers libjami's downloadFile, which
+ * connects to the offering peer and streams bytes to `path`.
+ *
+ * message_id: offer commit id from FILE_RECV.message_id (libjami spells
+ *             this `interactionId` at the API boundary).
+ * file_id:    canonical file identifier from FILE_RECV.file_id.
+ * path:       absolute destination path. The directory must exist; libjami
+ *             writes to a `.tmp` sibling and renames on success.
+ *
+ * Returns 0 on enqueue, -1 on validation failure.
+ */
+int carrier_accept_file(Carrier    *c,
+                        const char *account_id,
+                        const char *conversation_id,
+                        const char *message_id,
+                        const char *file_id,
+                        const char *path);
+
+/*
+ * Cancel an in-flight transfer (incoming or outgoing). libjami emits a
+ * terminal DataTransferEvent that surfaces as FILE_COMPLETE with
+ * status="closed_by_host" (we cancelled) or "closed_by_peer" (peer
+ * cancelled before we got here).
+ *
+ * Returns 0 on enqueue, -1 on validation failure / unknown id.
+ */
+int carrier_cancel_file(Carrier    *c,
+                        const char *account_id,
+                        const char *conversation_id,
+                        const char *file_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -271,6 +271,46 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fputc('"', out);
             break;
 
+        case CARRIER_EVENT_FILE_RECV:
+            emit_header(out, "FileRecv", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->file_recv.conversation_id);
+            fprintf(out, "\" ; carrier:contactUri \"");
+            turtle_escape(out, ev->file_recv.contact_uri);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->file_recv.message_id);
+            fprintf(out, "\" ; carrier:fileId \"");
+            turtle_escape(out, ev->file_recv.file_id);
+            fputc('"', out);
+            if (ev->file_recv.filename[0]) {
+                fprintf(out, " ; carrier:filename \"");
+                turtle_escape(out, ev->file_recv.filename);
+                fputc('"', out);
+            }
+            fprintf(out, " ; carrier:size %llu",
+                    (unsigned long long)ev->file_recv.size);
+            break;
+
+        case CARRIER_EVENT_FILE_PROGRESS:
+            emit_header(out, "FileProgress", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->file_progress.conversation_id);
+            fprintf(out, "\" ; carrier:fileId \"");
+            turtle_escape(out, ev->file_progress.file_id);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_FILE_COMPLETE:
+            emit_header(out, "FileComplete", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->file_complete.conversation_id);
+            fprintf(out, "\" ; carrier:fileId \"");
+            turtle_escape(out, ev->file_complete.file_id);
+            fprintf(out, "\" ; carrier:status \"");
+            turtle_escape(out, ev->file_complete.status);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_ERROR:
             emit_header(out, "Error", ev->account_id);
             fprintf(out, " ; carrier:command \"");
