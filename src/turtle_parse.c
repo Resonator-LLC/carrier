@@ -374,6 +374,24 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- Reactions --- */
+
+    if (strcmp(stmt->type, "SendReaction") == 0) {
+        const char *account = require_account(c, stmt, "SendReaction");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *msg  = find_pred(stmt, "messageId");
+        const char *react = find_pred(stmt, "reaction");
+        if (!conv || !msg || !react) {
+            carrier_emit_error(c, "SendReaction", "MissingField",
+                               "carrier:conversationId, carrier:messageId, "
+                               "and carrier:reaction required");
+            return 0;
+        }
+        carrier_send_reaction(c, account, conv, msg, react);
+        return 0;
+    }
+
     /* --- Meta --- */
 
     if (strcmp(stmt->type, "Quit") == 0) {

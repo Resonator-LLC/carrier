@@ -274,7 +274,8 @@ void on_swarm_message_received(Carrier *c,
         copy_fixed(qe.ev.text_message.contact_uri, CARRIER_URI_LEN, from);
         copy_fixed(qe.ev.text_message.conversation_id,
                    CARRIER_CONVERSATION_ID_LEN, conversationId);
-        qe.ev.text_message.message_id = 0;   /* SwarmMessage uses string IDs */
+        copy_fixed(qe.ev.text_message.message_id,
+                   CARRIER_MESSAGE_ID_LEN, message.id);
         qe.message_text = std::move(body);
         qe.ev.text_message.text = qe.message_text.c_str();
         qe.ev.text_message.text_len = qe.message_text.size();
@@ -283,6 +284,8 @@ void on_swarm_message_received(Carrier *c,
         set_account(qe.ev, accountId);
         copy_fixed(qe.ev.group_message.conversation_id,
                    CARRIER_CONVERSATION_ID_LEN, conversationId);
+        copy_fixed(qe.ev.group_message.message_id,
+                   CARRIER_MESSAGE_ID_LEN, message.id);
         copy_fixed(qe.ev.group_message.contact_uri, CARRIER_URI_LEN, from);
         /* libjami's SwarmMessage body has no display_name; leave empty.
          * Consumers can resolve via ContactName events or
@@ -293,6 +296,55 @@ void on_swarm_message_received(Carrier *c,
         qe.ev.group_message.text_len = qe.message_text.size();
     }
 
+    carrier_push_event(c, std::move(qe));
+}
+
+/* ---------------------------------------------------------------------------
+ * ReactionAdded handler
+ *
+ * libjami emits this when a peer's `react-to` commit lands on one of our
+ * Swarms. The reaction map carries libjami's full commit body — we surface
+ * the fields the carrier:Reaction vocab calls for: messageId (the reacted-to
+ * commit), reaction body (the emoji), and author. The reaction's own commit
+ * id rides along as `reaction_id` for callers that want to address the
+ * reaction itself (e.g. to mirror a remove/edit later).
+ * ---------------------------------------------------------------------------*/
+
+void on_reaction_added(Carrier *c,
+                       const std::string &accountId,
+                       const std::string &conversationId,
+                       const std::string &messageId,
+                       const std::map<std::string, std::string> &reaction)
+{
+    auto get = [&](const char *key) -> std::string {
+        auto it = reaction.find(key);
+        return it == reaction.end() ? std::string{} : it->second;
+    };
+
+    const std::string author = get("author");
+    const std::string body   = get("body");
+    const std::string rid    = get("id");
+
+    /* Skip our own reactions echoed back via Swarm sync. Mirrors the
+     * own-message filter in on_swarm_message_received. */
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        auto it = c->accounts.find(accountId);
+        if (it != c->accounts.end() && !it->second.self_uri.empty() &&
+            author == it->second.self_uri) {
+            return;
+        }
+    }
+
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_REACTION);
+    set_account(qe.ev, accountId);
+    copy_fixed(qe.ev.reaction.conversation_id,
+               CARRIER_CONVERSATION_ID_LEN, conversationId);
+    copy_fixed(qe.ev.reaction.message_id, CARRIER_MESSAGE_ID_LEN, messageId);
+    copy_fixed(qe.ev.reaction.reaction_id, CARRIER_MESSAGE_ID_LEN, rid);
+    copy_fixed(qe.ev.reaction.contact_uri, CARRIER_URI_LEN, author);
+    copy_fixed(qe.ev.reaction.text, CARRIER_REACTION_LEN, body);
     carrier_push_event(c, std::move(qe));
 }
 
@@ -309,11 +361,7 @@ void on_account_message_status(Carrier *c,
     copy_fixed(qe.ev.message_sent.contact_uri, CARRIER_URI_LEN, peer);
     copy_fixed(qe.ev.message_sent.conversation_id,
                CARRIER_CONVERSATION_ID_LEN, conversationId);
-
-    /* libjami message IDs are decimal-encoded uint64_t strings on this signal. */
-    qe.ev.message_sent.message_id = message_id.empty()
-        ? 0
-        : std::strtoull(message_id.c_str(), nullptr, 10);
+    copy_fixed(qe.ev.message_sent.message_id, CARRIER_MESSAGE_ID_LEN, message_id);
     qe.ev.message_sent.status = state;
 
     carrier_push_event(c, std::move(qe));
@@ -495,6 +543,13 @@ void carrier_register_signals(Carrier *c)
     handlers.insert(exportable_callback<VS::ConversationRemoved>(
         [c](const std::string &accountId, const std::string &conversationId) {
             on_conversation_removed(c, accountId, conversationId);
+        }));
+
+    handlers.insert(exportable_callback<VS::ReactionAdded>(
+        [c](const std::string &accountId, const std::string &conversationId,
+            const std::string &messageId,
+            std::map<std::string, std::string> reaction) {
+            on_reaction_added(c, accountId, conversationId, messageId, reaction);
         }));
 
     libjami::registerSignalHandlers(handlers);

@@ -13,12 +13,18 @@
  *  and src/carrier_jami_signals.cc. See arch/jami-migration.md for the full
  *  migration plan; decisions D1–D20 are the load-bearing context.
  *
- *  Scope as of M3 (this header): lifecycle, account creation/loading, self-ID,
- *  trust requests, 1:1 text messaging, and multi-party Swarm conversations
- *  (create, send, accept/decline invitation, invite member, remove).
- *  Calls, files, reactions, device-linking, continuous presence in M4.
- *  Functions and event types are added in later milestones as they land —
- *  there are no forward-declared placeholders for unimplemented surface.
+ *  Scope as of M4a (this header): lifecycle, account creation/loading,
+ *  self-ID, trust requests, 1:1 text messaging, multi-party Swarm
+ *  conversations (create, send, accept/decline invitation, invite member,
+ *  remove), reactions, continuous presence, device linking, and Swarm file
+ *  transfers. Calls (audio/video) deferred to M4b. Functions and event
+ *  types are added in later milestones as they land — there are no
+ *  forward-declared placeholders for unimplemented surface.
+ *
+ *  v3.2 break (M4a): `message_id` is now a 40-hex Swarm commit hash
+ *  (`char[CARRIER_MESSAGE_ID_LEN]`) on every event that carries one,
+ *  matching libjami's ground truth. The v3.1 `uint64_t message_id` was a
+ *  Tox-era artifact — Jami never had numeric message IDs.
  *
  *  Threading: libjami signals fire on daemon worker threads. The shim
  *  marshals them into a bounded queue + clock fd (eventfd on Linux, self-pipe
@@ -39,9 +45,9 @@
 #define CARRIER_H
 
 #define CARRIER_VERSION_MAJOR 3
-#define CARRIER_VERSION_MINOR 1
+#define CARRIER_VERSION_MINOR 2
 #define CARRIER_VERSION_PATCH 0
-#define CARRIER_VERSION_STRING "3.1.0-dev"
+#define CARRIER_VERSION_STRING "3.2.0-dev"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -64,7 +70,9 @@ typedef struct Carrier Carrier;
 #define CARRIER_URI_LEN              128  /* "jami:<40hex>" or SIP URI, with headroom */
 #define CARRIER_ACCOUNT_ID_LEN        64  /* libjami internal account handle */
 #define CARRIER_CONVERSATION_ID_LEN   64  /* Swarm commit hash (40 hex) + headroom */
+#define CARRIER_MESSAGE_ID_LEN        64  /* Swarm message commit hash (40 hex) + headroom */
 #define CARRIER_NAME_LEN             128  /* display name */
+#define CARRIER_REACTION_LEN          32  /* emoji grapheme cluster, generous cap */
 
 /* ---------------------------------------------------------------------------
  * Event types
@@ -89,6 +97,7 @@ typedef enum {
     CARRIER_EVENT_CONVERSATION_READY,       /* Swarm cloned/synced enough to use */
     CARRIER_EVENT_CONVERSATION_SYNC_FINISHED, /* per-account: all swarms synced */
     CARRIER_EVENT_SWARM_COMMIT,             /* raw Swarm git commit (DAG-level view) */
+    CARRIER_EVENT_REACTION,                 /* peer reacted to a Swarm message (M4) */
     CARRIER_EVENT_ERROR,                    /* command-level failure */
     CARRIER_EVENT_SYSTEM,                   /* operational notice */
 } CarrierEventType;
@@ -148,11 +157,14 @@ typedef struct {
         /* Inbound 1:1 text message. At M2, Swarm conversations are an
          * implementation detail of 1:1 messaging — `conversation_id` is
          * surfaced so M3+ callers (who address Swarms directly) see the
-         * same field on both paths. */
+         * same field on both paths.
+         *
+         * `message_id` is the Swarm git commit hash (40-hex SHA-1) — used
+         * to address the message for reactions, edits, and threading. */
         struct {
             char        contact_uri[CARRIER_URI_LEN];
             char        conversation_id[CARRIER_CONVERSATION_ID_LEN];
-            uint64_t    message_id;   /* libjami message handle */
+            char        message_id[CARRIER_MESSAGE_ID_LEN];
             const char *text;         /* UTF-8, callback-scoped, not NUL-bounded */
             size_t      text_len;
         } text_message;
@@ -161,10 +173,10 @@ typedef struct {
          * `status` values mirror libjami's MessageStates enum:
          *   0 UNKNOWN, 1 SENDING, 2 SENT, 3 READ, 4 FAILURE, 5 CANCELLED. */
         struct {
-            char     contact_uri[CARRIER_URI_LEN];
-            char     conversation_id[CARRIER_CONVERSATION_ID_LEN];
-            uint64_t message_id;
-            int      status;
+            char contact_uri[CARRIER_URI_LEN];
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char message_id[CARRIER_MESSAGE_ID_LEN];
+            int  status;
         } message_sent;
 
         /* Inbound multi-party Swarm text message. Distinct from text_message
@@ -173,9 +185,10 @@ typedef struct {
          * the shim discriminates by conversation privacy mode. */
         struct {
             char        conversation_id[CARRIER_CONVERSATION_ID_LEN];
-            char        contact_uri[CARRIER_URI_LEN];      /* sender */
-            char        display_name[CARRIER_NAME_LEN];    /* sender's display name (may be empty) */
-            const char *text;                              /* UTF-8, callback-scoped */
+            char        message_id[CARRIER_MESSAGE_ID_LEN];   /* Swarm commit hash */
+            char        contact_uri[CARRIER_URI_LEN];         /* sender */
+            char        display_name[CARRIER_NAME_LEN];       /* sender's display name (may be empty) */
+            const char *text;                                 /* UTF-8, callback-scoped */
             size_t      text_len;
         } group_message;
 
@@ -218,10 +231,21 @@ typedef struct {
          * including non-text). Coarser than group_message; for consumers
          * that want the underlying DAG. */
         struct {
-            char     conversation_id[CARRIER_CONVERSATION_ID_LEN];
-            uint64_t message_id;
-            char     contact_uri[CARRIER_URI_LEN];   /* commit author */
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char message_id[CARRIER_MESSAGE_ID_LEN];
+            char contact_uri[CARRIER_URI_LEN];       /* commit author */
         } swarm_commit;
+
+        /* Inbound emoji reaction on a Swarm message. `message_id` is the
+         * commit being reacted to; `reaction_id` is the Swarm commit that
+         * carries the reaction itself. `text` is the emoji body. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char message_id[CARRIER_MESSAGE_ID_LEN];     /* reacted-to commit */
+            char reaction_id[CARRIER_MESSAGE_ID_LEN];    /* the reaction commit */
+            char contact_uri[CARRIER_URI_LEN];           /* reactor */
+            char text[CARRIER_REACTION_LEN];             /* emoji */
+        } reaction;
 
         /* A command was rejected. `command` is the RDF local name (e.g.
          * "SendTrustRequest") when triaged at the dispatch layer; otherwise
@@ -591,6 +615,33 @@ int carrier_invite_to_conversation(Carrier    *c,
 int carrier_remove_conversation(Carrier    *c,
                                 const char *account_id,
                                 const char *conversation_id);
+
+/* ---------------------------------------------------------------------------
+ * Reactions
+ *
+ * Reactions ride on libjami's sendMessage(flag=2) — the daemon writes a
+ * Swarm commit with a `react-to` link to the target message. Inbound
+ * reactions surface as CARRIER_EVENT_REACTION (typed event) rather than
+ * as a separate ReactionAdded/Removed pair: the granularity matches the
+ * vocab and lets receivers maintain a per-message reaction set without
+ * mirroring libjami's internal commit DAG.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Add an emoji reaction to a Swarm message.
+ *
+ * conversation_id: conversation containing the reacted-to message.
+ * message_id:      target message's Swarm commit hash (40-hex). Obtained
+ *                  from CARRIER_EVENT_TEXT_MESSAGE / GROUP_MESSAGE.
+ * reaction:        emoji body, typically a single grapheme.
+ *
+ * Returns 0 on enqueue, -1 on validation failure.
+ */
+int carrier_send_reaction(Carrier    *c,
+                          const char *account_id,
+                          const char *conversation_id,
+                          const char *message_id,
+                          const char *reaction);
 
 #ifdef __cplusplus
 } /* extern "C" */

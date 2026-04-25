@@ -151,8 +151,9 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             turtle_escape(out, ev->text_message.contact_uri);
             fprintf(out, "\" ; carrier:conversationId \"");
             turtle_escape(out, ev->text_message.conversation_id);
-            fprintf(out, "\" ; carrier:messageId %llu ; carrier:text \"",
-                    (unsigned long long)ev->text_message.message_id);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->text_message.message_id);
+            fprintf(out, "\" ; carrier:text \"");
             if (ev->text_message.text) {
                 turtle_escape_n(out, ev->text_message.text, ev->text_message.text_len);
             }
@@ -165,15 +166,17 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             turtle_escape(out, ev->message_sent.contact_uri);
             fprintf(out, "\" ; carrier:conversationId \"");
             turtle_escape(out, ev->message_sent.conversation_id);
-            fprintf(out, "\" ; carrier:messageId %llu ; carrier:status %d",
-                    (unsigned long long)ev->message_sent.message_id,
-                    ev->message_sent.status);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->message_sent.message_id);
+            fprintf(out, "\" ; carrier:status %d", ev->message_sent.status);
             break;
 
         case CARRIER_EVENT_GROUP_MESSAGE:
             emit_header(out, "GroupMessage", ev->account_id);
             fprintf(out, " ; carrier:conversationId \"");
             turtle_escape(out, ev->group_message.conversation_id);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->group_message.message_id);
             fprintf(out, "\" ; carrier:contactUri \"");
             turtle_escape(out, ev->group_message.contact_uri);
             fputc('"', out);
@@ -236,8 +239,27 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             turtle_escape(out, ev->swarm_commit.conversation_id);
             fprintf(out, "\" ; carrier:contactUri \"");
             turtle_escape(out, ev->swarm_commit.contact_uri);
-            fprintf(out, "\" ; carrier:messageId %llu",
-                    (unsigned long long)ev->swarm_commit.message_id);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->swarm_commit.message_id);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_REACTION:
+            emit_header(out, "Reaction", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->reaction.conversation_id);
+            fprintf(out, "\" ; carrier:messageId \"");
+            turtle_escape(out, ev->reaction.message_id);
+            fprintf(out, "\" ; carrier:contactUri \"");
+            turtle_escape(out, ev->reaction.contact_uri);
+            fprintf(out, "\" ; carrier:reaction \"");
+            turtle_escape(out, ev->reaction.text);
+            fputc('"', out);
+            if (ev->reaction.reaction_id[0]) {
+                fprintf(out, " ; carrier:reactionId \"");
+                turtle_escape(out, ev->reaction.reaction_id);
+                fputc('"', out);
+            }
             break;
 
         case CARRIER_EVENT_ERROR:

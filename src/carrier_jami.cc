@@ -629,3 +629,25 @@ extern "C" int carrier_remove_conversation(Carrier    *c,
 
     return ok ? 0 : -1;
 }
+
+/* ---------------------------------------------------------------------------
+ * Reactions
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_send_reaction(Carrier    *c,
+                                     const char *account_id,
+                                     const char *conversation_id,
+                                     const char *message_id,
+                                     const char *reaction)
+{
+    if (!c || !account_id || !conversation_id || !message_id || !reaction) {
+        return -1;
+    }
+    /* libjami sendMessage(flag=2) routes to ConversationModule::reactToMessage,
+     * which commits a `text/plain` message with body=reaction and a
+     * `react-to: <message_id>` link. The peer side surfaces it through
+     * the ReactionAdded signal (see on_reaction_added). */
+    libjami::sendMessage(account_id, conversation_id, reaction,
+                         /*replyTo=*/message_id, /*flag=*/2);
+    return 0;
+}
