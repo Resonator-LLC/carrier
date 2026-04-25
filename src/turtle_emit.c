@@ -170,6 +170,76 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
                     ev->message_sent.status);
             break;
 
+        case CARRIER_EVENT_GROUP_MESSAGE:
+            emit_header(out, "GroupMessage", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->group_message.conversation_id);
+            fprintf(out, "\" ; carrier:contactUri \"");
+            turtle_escape(out, ev->group_message.contact_uri);
+            fputc('"', out);
+            if (ev->group_message.display_name[0]) {
+                fprintf(out, " ; carrier:displayName \"");
+                turtle_escape(out, ev->group_message.display_name);
+                fputc('"', out);
+            }
+            fprintf(out, " ; carrier:text \"");
+            if (ev->group_message.text) {
+                turtle_escape_n(out, ev->group_message.text,
+                                ev->group_message.text_len);
+            }
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_GROUP_PEER_JOIN:
+            emit_header(out, "GroupPeerJoin", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->group_peer_join.conversation_id);
+            fprintf(out, "\" ; carrier:memberUri \"");
+            turtle_escape(out, ev->group_peer_join.member_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_GROUP_PEER_EXIT:
+            emit_header(out, "GroupPeerExit", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->group_peer_exit.conversation_id);
+            fprintf(out, "\" ; carrier:memberUri \"");
+            turtle_escape(out, ev->group_peer_exit.member_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_CONVERSATION_REQUEST:
+            emit_header(out, "ConversationRequest", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->conversation_request.conversation_id);
+            fprintf(out, "\" ; carrier:contactUri \"");
+            turtle_escape(out, ev->conversation_request.contact_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_CONVERSATION_READY:
+            emit_header(out, "ConversationReady", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->conversation_ready.conversation_id);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_CONVERSATION_SYNC_FINISHED:
+            /* libjami's ConversationSyncFinished signal is account-scoped;
+             * no per-conversation id is available. Emit account-only. */
+            emit_header(out, "ConversationSyncFinished", ev->account_id);
+            break;
+
+        case CARRIER_EVENT_SWARM_COMMIT:
+            emit_header(out, "SwarmCommit", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->swarm_commit.conversation_id);
+            fprintf(out, "\" ; carrier:contactUri \"");
+            turtle_escape(out, ev->swarm_commit.contact_uri);
+            fprintf(out, "\" ; carrier:messageId %llu",
+                    (unsigned long long)ev->swarm_commit.message_id);
+            break;
+
         case CARRIER_EVENT_ERROR:
             emit_header(out, "Error", ev->account_id);
             fprintf(out, " ; carrier:command \"");

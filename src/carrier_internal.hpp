@@ -66,6 +66,14 @@ struct AccountState
      * libjami::getConversations() on account load; updated on
      * ConversationReady signals. Guarded by Carrier::accounts_mtx. */
     std::unordered_map<std::string, std::string> peer_conversations;
+
+    /* Cache: conversation_id → privacy mode ("one_to_one", "admin_invites",
+     * "invites_only", "public"). Used to discriminate inbound 1:1 vs
+     * multi-party SwarmMessageReceived signals (1:1 → TextMessage,
+     * everything else → GroupMessage). Populated lazily on first signal
+     * for a given conversation, and on carrier_create_conversation /
+     * carrier_accept_conversation_request. Guarded by accounts_mtx. */
+    std::unordered_map<std::string, std::string> conversation_modes;
 };
 
 /* ---------------------------------------------------------------------------

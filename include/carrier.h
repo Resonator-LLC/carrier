@@ -13,9 +13,10 @@
  *  and src/carrier_jami_signals.cc. See arch/jami-migration.md for the full
  *  migration plan; decisions D1–D20 are the load-bearing context.
  *
- *  M2 scope (this header): lifecycle, account creation/loading, self-ID,
- *  trust requests, and 1:1 text messaging. Groups / multi-party Swarms come
- *  in M3; calls, files, reactions, device-linking, continuous presence in M4.
+ *  Scope as of M3 (this header): lifecycle, account creation/loading, self-ID,
+ *  trust requests, 1:1 text messaging, and multi-party Swarm conversations
+ *  (create, send, accept/decline invitation, invite member, remove).
+ *  Calls, files, reactions, device-linking, continuous presence in M4.
  *  Functions and event types are added in later milestones as they land —
  *  there are no forward-declared placeholders for unimplemented surface.
  *
@@ -38,9 +39,9 @@
 #define CARRIER_H
 
 #define CARRIER_VERSION_MAJOR 3
-#define CARRIER_VERSION_MINOR 0
+#define CARRIER_VERSION_MINOR 1
 #define CARRIER_VERSION_PATCH 0
-#define CARRIER_VERSION_STRING "3.0.0-dev"
+#define CARRIER_VERSION_STRING "3.1.0-dev"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -70,19 +71,26 @@ typedef struct Carrier Carrier;
  * ---------------------------------------------------------------------------*/
 
 typedef enum {
-    CARRIER_EVENT_CONNECTED,         /* libjami daemon up, account registered */
-    CARRIER_EVENT_DISCONNECTED,      /* account lost registration */
-    CARRIER_EVENT_ACCOUNT_READY,     /* account reached REGISTERED; safe to send */
-    CARRIER_EVENT_ACCOUNT_ERROR,     /* registration failed; see `cause` */
-    CARRIER_EVENT_SELF_ID,           /* response to carrier_get_id() */
-    CARRIER_EVENT_TRUST_REQUEST,     /* peer sent us a trust request */
-    CARRIER_EVENT_CONTACT_ONLINE,    /* peer reachable on the DHT */
-    CARRIER_EVENT_CONTACT_OFFLINE,   /* peer unreachable */
-    CARRIER_EVENT_CONTACT_NAME,      /* peer published a display name */
-    CARRIER_EVENT_TEXT_MESSAGE,      /* inbound 1:1 text message */
-    CARRIER_EVENT_MESSAGE_SENT,      /* status update for an outbound message */
-    CARRIER_EVENT_ERROR,             /* command-level failure */
-    CARRIER_EVENT_SYSTEM,            /* operational notice */
+    CARRIER_EVENT_CONNECTED,                /* libjami daemon up, account registered */
+    CARRIER_EVENT_DISCONNECTED,             /* account lost registration */
+    CARRIER_EVENT_ACCOUNT_READY,            /* account reached REGISTERED; safe to send */
+    CARRIER_EVENT_ACCOUNT_ERROR,            /* registration failed; see `cause` */
+    CARRIER_EVENT_SELF_ID,                  /* response to carrier_get_id() */
+    CARRIER_EVENT_TRUST_REQUEST,            /* peer sent us a trust request */
+    CARRIER_EVENT_CONTACT_ONLINE,           /* peer reachable on the DHT */
+    CARRIER_EVENT_CONTACT_OFFLINE,          /* peer unreachable */
+    CARRIER_EVENT_CONTACT_NAME,             /* peer published a display name */
+    CARRIER_EVENT_TEXT_MESSAGE,             /* inbound 1:1 text message */
+    CARRIER_EVENT_MESSAGE_SENT,             /* status update for an outbound message */
+    CARRIER_EVENT_GROUP_MESSAGE,            /* inbound multi-party Swarm text message */
+    CARRIER_EVENT_GROUP_PEER_JOIN,          /* a member joined a Swarm conversation */
+    CARRIER_EVENT_GROUP_PEER_EXIT,          /* a member left or was banned */
+    CARRIER_EVENT_CONVERSATION_REQUEST,     /* invitation to join a Swarm */
+    CARRIER_EVENT_CONVERSATION_READY,       /* Swarm cloned/synced enough to use */
+    CARRIER_EVENT_CONVERSATION_SYNC_FINISHED, /* per-account: all swarms synced */
+    CARRIER_EVENT_SWARM_COMMIT,             /* raw Swarm git commit (DAG-level view) */
+    CARRIER_EVENT_ERROR,                    /* command-level failure */
+    CARRIER_EVENT_SYSTEM,                   /* operational notice */
 } CarrierEventType;
 
 /* ---------------------------------------------------------------------------
@@ -158,6 +166,62 @@ typedef struct {
             uint64_t message_id;
             int      status;
         } message_sent;
+
+        /* Inbound multi-party Swarm text message. Distinct from text_message
+         * so callers can route 1:1 vs group conversations differently;
+         * SwarmMessageReceived is the same libjami signal in both cases —
+         * the shim discriminates by conversation privacy mode. */
+        struct {
+            char        conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char        contact_uri[CARRIER_URI_LEN];      /* sender */
+            char        display_name[CARRIER_NAME_LEN];    /* sender's display name (may be empty) */
+            const char *text;                              /* UTF-8, callback-scoped */
+            size_t      text_len;
+        } group_message;
+
+        /* A member joined or was added to a Swarm conversation
+         * (ConversationMemberEvent action=joins). */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char member_uri[CARRIER_URI_LEN];
+        } group_peer_join;
+
+        /* A member left or was banned from a Swarm conversation
+         * (ConversationMemberEvent action=leave or banned). */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char member_uri[CARRIER_URI_LEN];
+        } group_peer_exit;
+
+        /* Inbound invitation to join a Swarm conversation. Reply via
+         * carrier_accept_conversation_request or
+         * carrier_decline_conversation_request. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            char contact_uri[CARRIER_URI_LEN];   /* inviter */
+        } conversation_request;
+
+        /* Swarm has cloned and synced enough to participate. Caller may
+         * begin sending messages on this conversation_id after this fires. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+        } conversation_ready;
+
+        /* Per-account synchronization complete: all Swarms this account
+         * is a member of have finished cloning. No conversation_id —
+         * libjami's signal is account-scoped. */
+        struct {
+            char _placeholder;  /* keeps the arm non-empty */
+        } conversation_sync_finished;
+
+        /* Raw Swarm git commit (DAG-level view, fires for every commit
+         * including non-text). Coarser than group_message; for consumers
+         * that want the underlying DAG. */
+        struct {
+            char     conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            uint64_t message_id;
+            char     contact_uri[CARRIER_URI_LEN];   /* commit author */
+        } swarm_commit;
 
         /* A command was rejected. `command` is the RDF local name (e.g.
          * "SendTrustRequest") when triaged at the dispatch layer; otherwise
@@ -401,8 +465,8 @@ int carrier_remove_contact(Carrier    *c,
  * seeded from libjami's getConversations() on account load; on cache miss
  * it creates the 1:1 Swarm (requires pre-existing trust).
  *
- * Direct Swarm addressing (carrier_send_conversation_message, group Swarms)
- * arrives in M3.
+ * For multi-party / group Swarms, address by conversation_id directly via
+ * carrier_send_conversation_message (below).
  * ---------------------------------------------------------------------------*/
 
 /*
@@ -421,6 +485,112 @@ int carrier_send_message(Carrier    *c,
                          const char *account_id,
                          const char *contact_uri,
                          const char *text);
+
+/* ---------------------------------------------------------------------------
+ * Swarm conversations (multi-party)
+ *
+ * Jami's Swarms back both 1:1 and multi-party conversations. The 1:1 case
+ * is hidden behind the Messaging API above (caller addresses by contact
+ * URI; the shim picks the Swarm). For everything else — admin-invites,
+ * invites-only, public — addresses are explicit conversation IDs (Swarm
+ * git tree hashes).
+ *
+ * Lifecycle:
+ *   1. Either party calls carrier_create_conversation, OR a
+ *      CARRIER_EVENT_CONVERSATION_REQUEST arrives and the local side
+ *      replies with carrier_accept_conversation_request.
+ *   2. Once the underlying Swarm has cloned/synced enough to be usable,
+ *      CARRIER_EVENT_CONVERSATION_READY fires. Senders SHOULD wait for
+ *      this event before issuing carrier_send_conversation_message —
+ *      libjami may queue messages sent earlier, but delivery is not
+ *      guaranteed until the Swarm is ready.
+ *   3. Members can be added with carrier_invite_to_conversation;
+ *      additions and departures surface as
+ *      CARRIER_EVENT_GROUP_PEER_JOIN / CARRIER_EVENT_GROUP_PEER_EXIT.
+ *   4. carrier_remove_conversation removes the conversation locally;
+ *      libjami marks the conversation as removed (and ban-cleans Swarm
+ *      state). The conversation_id may still appear in inbound peer
+ *      events until the remote side notices.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Create a new Swarm conversation.
+ *
+ * privacy: one of "one_to_one", "admin_invites", "invites_only", "public".
+ *          See arch/namespaces.md for the policy summary. NULL or "" is
+ *          treated as "invites_only" (libjami's default mode).
+ * out_conversation_id: buffer receiving the new conversation hash,
+ *                      NUL-terminated. Must be at least
+ *                      CARRIER_CONVERSATION_ID_LEN bytes. Populated
+ *                      synchronously before this call returns.
+ *
+ * CARRIER_EVENT_CONVERSATION_READY will fire once the local Swarm has
+ * been written to disk (typically immediate for self-created Swarms).
+ *
+ * Returns 0 on success, -1 on libjami failure.
+ */
+int carrier_create_conversation(Carrier    *c,
+                                const char *account_id,
+                                const char *privacy,
+                                char        out_conversation_id[CARRIER_CONVERSATION_ID_LEN]);
+
+/*
+ * Send a text message to a Swarm conversation by ID. For 1:1 Swarms, the
+ * caller-friendly entry point is carrier_send_message (which resolves the
+ * conversation by contact URI). This call is for multi-party Swarms.
+ *
+ * Delivery status arrives asynchronously via CARRIER_EVENT_MESSAGE_SENT,
+ * correlated by the libjami message_id.
+ *
+ * Returns 0 on enqueue, -1 on validation failure.
+ */
+int carrier_send_conversation_message(Carrier    *c,
+                                      const char *account_id,
+                                      const char *conversation_id,
+                                      const char *text);
+
+/*
+ * Accept an inbound invitation to a Swarm conversation. The Swarm clones
+ * and CARRIER_EVENT_CONVERSATION_READY fires once enough of the DAG is
+ * available to participate.
+ */
+int carrier_accept_conversation_request(Carrier    *c,
+                                        const char *account_id,
+                                        const char *conversation_id);
+
+/*
+ * Decline an inbound Swarm invitation. The local-side state is cleared;
+ * the inviting side is notified via ConversationRequestDeclined and may
+ * stop trying to deliver to us.
+ */
+int carrier_decline_conversation_request(Carrier    *c,
+                                         const char *account_id,
+                                         const char *conversation_id);
+
+/*
+ * Add a contact to a Swarm conversation. The peer must already be a
+ * trusted contact of `account_id`. The added member receives a
+ * CARRIER_EVENT_CONVERSATION_REQUEST; on acceptance, both sides see
+ * CARRIER_EVENT_GROUP_PEER_JOIN.
+ *
+ * Returns 0 on enqueue, -1 on invalid URI / unknown account /
+ * unknown conversation.
+ */
+int carrier_invite_to_conversation(Carrier    *c,
+                                   const char *account_id,
+                                   const char *conversation_id,
+                                   const char *contact_uri);
+
+/*
+ * Remove a Swarm conversation locally. For multi-party Swarms this drops
+ * our view of the conversation; other members continue. For 1:1 Swarms
+ * this also drops the underlying contact relationship (libjami semantics).
+ *
+ * Returns 0 on enqueue, -1 on unknown account / conversation.
+ */
+int carrier_remove_conversation(Carrier    *c,
+                                const char *account_id,
+                                const char *conversation_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

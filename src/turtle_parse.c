@@ -3,9 +3,12 @@
  *  Turtle command parser for Carrier, powered by Serd.
  *  Parses RDF 1.1 Turtle input and dispatches carrier_*() calls.
  *
- *  M2 command surface: CreateAccount, LoadAccount, GetId, SetNick,
+ *  Command surface: CreateAccount, LoadAccount, GetId, SetNick,
  *  SendTrustRequest, AcceptTrustRequest, DiscardTrustRequest, RemoveContact,
- *  SendMsg, Quit. See arch/jami-migration.md §4.
+ *  SendMsg (1:1), Quit, plus M3 multi-party Swarm commands —
+ *  CreateConversation (+ CreateGroup alias), SendConversationMsg,
+ *  AcceptConversationRequest, DeclineConversationRequest, InviteContact,
+ *  RemoveConversation. See arch/jami-migration.md §4 for the rename map.
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
@@ -286,6 +289,91 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- Swarm conversations (multi-party) --- */
+
+    /* `CreateGroup` is the v0.2 vocabulary name; `CreateConversation` is
+     * accepted as an alias since both libjami and the C API spell it that
+     * way. Either dispatches to carrier_create_conversation. */
+    if (strcmp(stmt->type, "CreateConversation") == 0 ||
+        strcmp(stmt->type, "CreateGroup") == 0) {
+        const char *account = require_account(c, stmt, stmt->type);
+        if (!account) return 0;
+        const char *privacy = find_pred(stmt, "privacy");
+        char new_id[CARRIER_CONVERSATION_ID_LEN];
+        if (carrier_create_conversation(c, account, privacy, new_id) != 0) {
+            carrier_emit_error(c, stmt->type, "LibjamiFailure",
+                               "carrier_create_conversation failed");
+        }
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "SendConversationMsg") == 0) {
+        const char *account = require_account(c, stmt, "SendConversationMsg");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *text = find_pred(stmt, "text");
+        if (!conv || !text) {
+            carrier_emit_error(c, "SendConversationMsg", "MissingField",
+                               "carrier:conversationId and carrier:text required");
+            return 0;
+        }
+        carrier_send_conversation_message(c, account, conv, text);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "AcceptConversationRequest") == 0) {
+        const char *account = require_account(c, stmt, "AcceptConversationRequest");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        if (!conv) {
+            carrier_emit_error(c, "AcceptConversationRequest", "MissingField",
+                               "carrier:conversationId required");
+            return 0;
+        }
+        carrier_accept_conversation_request(c, account, conv);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "DeclineConversationRequest") == 0) {
+        const char *account = require_account(c, stmt, "DeclineConversationRequest");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        if (!conv) {
+            carrier_emit_error(c, "DeclineConversationRequest", "MissingField",
+                               "carrier:conversationId required");
+            return 0;
+        }
+        carrier_decline_conversation_request(c, account, conv);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "InviteContact") == 0) {
+        const char *account = require_account(c, stmt, "InviteContact");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!conv || !uri) {
+            carrier_emit_error(c, "InviteContact", "MissingField",
+                               "carrier:conversationId and carrier:contactUri required");
+            return 0;
+        }
+        carrier_invite_to_conversation(c, account, conv, uri);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "RemoveConversation") == 0) {
+        const char *account = require_account(c, stmt, "RemoveConversation");
+        if (!account) return 0;
+        const char *conv = find_pred(stmt, "conversationId");
+        if (!conv) {
+            carrier_emit_error(c, "RemoveConversation", "MissingField",
+                               "carrier:conversationId required");
+            return 0;
+        }
+        carrier_remove_conversation(c, account, conv);
+        return 0;
+    }
+
     /* --- Meta --- */
 
     if (strcmp(stmt->type, "Quit") == 0) {
@@ -293,7 +381,7 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
     }
 
     carrier_emit_error(c, stmt->type, "UnknownCommand",
-                       "no such command in M2 vocabulary");
+                       "no such command in carrier vocabulary");
     return 0;
 }
 

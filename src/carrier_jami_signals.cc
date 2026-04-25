@@ -112,6 +112,28 @@ void on_registration_state(Carrier *c,
         stamp(connected.ev, CARRIER_EVENT_CONNECTED);
         set_account(connected.ev, accountId);
         carrier_push_event(c, std::move(connected));
+
+        /* Synthetic ConversationReady for each existing Swarm.
+         *
+         * libjami's `ConversationReady` signal fires only on initial
+         * creation (carrier_create_conversation) or on first remote clone
+         * (after accept_trust_request / accept_conversation_request). When
+         * an account is loaded with conversations already on disk, libjami
+         * stays silent — it has nothing to clone or create. Consumers that
+         * gate on ConversationReady would deadlock on restart.
+         *
+         * Enumerate the conversations and emit synthetic events so the
+         * caller's wait_for(ConversationReady) terminates uniformly across
+         * fresh-create, accepted-clone, and reloaded-from-disk paths. */
+        const auto convs = libjami::getConversations(accountId);
+        for (const auto &conv_id : convs) {
+            QueuedEvent cev;
+            stamp(cev.ev, CARRIER_EVENT_CONVERSATION_READY);
+            set_account(cev.ev, accountId);
+            copy_fixed(cev.ev.conversation_ready.conversation_id,
+                       CARRIER_CONVERSATION_ID_LEN, conv_id);
+            carrier_push_event(c, std::move(cev));
+        }
         return;
     }
 
@@ -162,13 +184,61 @@ void on_incoming_trust_request(Carrier *c,
     carrier_push_event(c, std::move(qe));
 }
 
+/* Translate libjami's "mode" metadata (int as string per ConversationMode
+ * enum: 0 ONE_TO_ONE, 1 ADMIN_INVITES_ONLY, 2 INVITES_ONLY, 3 PUBLIC) into
+ * the carrier:privacy vocabulary string. Empty input or unknown values fall
+ * back to "invites_only" (libjami's documented default mode). */
+std::string privacy_from_mode_str(const std::string &s)
+{
+    if (s == "0") return "one_to_one";
+    if (s == "1") return "admin_invites";
+    if (s == "2") return "invites_only";
+    if (s == "3") return "public";
+    return "invites_only";
+}
+
+/* Resolve the privacy mode for a conversation. Hits the per-account cache
+ * first; on miss queries libjami::conversationInfos and seeds the cache.
+ * Returns "invites_only" if libjami has nothing — caller treats as
+ * not-1:1, which is the safe default for routing. */
+std::string resolve_conversation_mode(Carrier *c,
+                                      const std::string &accountId,
+                                      const std::string &conversationId)
+{
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        auto it = c->accounts.find(accountId);
+        if (it != c->accounts.end()) {
+            auto cm = it->second.conversation_modes.find(conversationId);
+            if (cm != it->second.conversation_modes.end()) {
+                return cm->second;
+            }
+        }
+    }
+
+    const auto infos = libjami::conversationInfos(accountId, conversationId);
+    auto it = infos.find("mode");
+    const std::string mode = (it == infos.end())
+        ? "invites_only"
+        : privacy_from_mode_str(it->second);
+
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        if (auto acct = c->accounts.find(accountId); acct != c->accounts.end()) {
+            acct->second.conversation_modes[conversationId] = mode;
+        }
+    }
+    return mode;
+}
+
 void on_swarm_message_received(Carrier *c,
                                const std::string &accountId,
                                const std::string &conversationId,
                                const libjami::SwarmMessage &message)
 {
-    /* Only surface text messages in M2. Other commit types (member add,
-     * profile updates, reactions) stay internal until M3/M4. */
+    /* Only surface text messages here. Other commit types (member events
+     * fire ConversationMemberEvent separately; profile updates and
+     * reactions stay internal until they have a typed event in M4). */
     if (message.type != "text/plain") {
         return;
     }
@@ -192,17 +262,36 @@ void on_swarm_message_received(Carrier *c,
         }
     }
 
-    QueuedEvent qe;
-    stamp(qe.ev, CARRIER_EVENT_TEXT_MESSAGE);
-    set_account(qe.ev, accountId);
-    copy_fixed(qe.ev.text_message.contact_uri, CARRIER_URI_LEN, from);
-    copy_fixed(qe.ev.text_message.conversation_id,
-               CARRIER_CONVERSATION_ID_LEN, conversationId);
+    /* Discriminate 1:1 vs multi-party. ONE_TO_ONE → TextMessage,
+     * everything else → GroupMessage. */
+    const std::string mode = resolve_conversation_mode(c, accountId, conversationId);
+    const bool is_one_to_one = (mode == "one_to_one");
 
-    qe.ev.text_message.message_id = 0;   /* SwarmMessage uses string IDs; not surfaced in M2 */
-    qe.message_text = std::move(body);
-    qe.ev.text_message.text = qe.message_text.c_str();
-    qe.ev.text_message.text_len = qe.message_text.size();
+    QueuedEvent qe;
+    if (is_one_to_one) {
+        stamp(qe.ev, CARRIER_EVENT_TEXT_MESSAGE);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.text_message.contact_uri, CARRIER_URI_LEN, from);
+        copy_fixed(qe.ev.text_message.conversation_id,
+                   CARRIER_CONVERSATION_ID_LEN, conversationId);
+        qe.ev.text_message.message_id = 0;   /* SwarmMessage uses string IDs */
+        qe.message_text = std::move(body);
+        qe.ev.text_message.text = qe.message_text.c_str();
+        qe.ev.text_message.text_len = qe.message_text.size();
+    } else {
+        stamp(qe.ev, CARRIER_EVENT_GROUP_MESSAGE);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.group_message.conversation_id,
+                   CARRIER_CONVERSATION_ID_LEN, conversationId);
+        copy_fixed(qe.ev.group_message.contact_uri, CARRIER_URI_LEN, from);
+        /* libjami's SwarmMessage body has no display_name; leave empty.
+         * Consumers can resolve via ContactName events or
+         * libjami::getConversationMembers if needed. */
+        qe.ev.group_message.display_name[0] = '\0';
+        qe.message_text = std::move(body);
+        qe.ev.group_message.text = qe.message_text.c_str();
+        qe.ev.group_message.text_len = qe.message_text.size();
+    }
 
     carrier_push_event(c, std::move(qe));
 }
@@ -234,17 +323,107 @@ void on_conversation_ready(Carrier *c,
                            const std::string &accountId,
                            const std::string &conversationId)
 {
-    /* Internal bookkeeping only — M3 will surface this as
-     * carrier:ConversationReady. For M2 we use it to populate the
-     * peer→conversation cache so carrier_send_message() can resolve
-     * a 1:1 conversation without re-querying libjami.
-     *
-     * Conversation membership is looked up lazily in carrier_send_message
-     * on cache miss; writing here requires another libjami call from a
-     * signal thread, which we avoid — the cache gets seeded on first send. */
-    (void) c;
-    (void) accountId;
-    (void) conversationId;
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_CONVERSATION_READY);
+    set_account(qe.ev, accountId);
+    copy_fixed(qe.ev.conversation_ready.conversation_id,
+               CARRIER_CONVERSATION_ID_LEN, conversationId);
+    carrier_push_event(c, std::move(qe));
+}
+
+void on_conversation_request_received(Carrier *c,
+                                      const std::string &accountId,
+                                      const std::string &conversationId,
+                                      const std::map<std::string, std::string> &metadatas)
+{
+    /* The metadata map carries `from` (inviter URI), `id` (==conversationId),
+     * `received` (unix ts), plus any vCard metadata. Per
+     * conversation_module.cpp:1957-1959, `from` is set by ConversationRequest::toMap.
+     * The 1:1 case is dispatched separately as a trust request, so
+     * surfacing this for multi-party invitations is the primary use case. */
+    std::string inviter;
+    if (auto it = metadatas.find("from"); it != metadatas.end()) {
+        inviter = it->second;
+    }
+
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_CONVERSATION_REQUEST);
+    set_account(qe.ev, accountId);
+    copy_fixed(qe.ev.conversation_request.conversation_id,
+               CARRIER_CONVERSATION_ID_LEN, conversationId);
+    copy_fixed(qe.ev.conversation_request.contact_uri,
+               CARRIER_URI_LEN, inviter);
+    carrier_push_event(c, std::move(qe));
+}
+
+void on_conversation_member_event(Carrier *c,
+                                  const std::string &accountId,
+                                  const std::string &conversationId,
+                                  const std::string &memberUri,
+                                  int action)
+{
+    /* libjami action codes (conversation.cpp:413-432):
+     *   0 add, 1 joins, 2 leave, 3 ban, 4 unban
+     * The "add" notification fires before the member has actually joined
+     * (admin invitation enqueued); we surface only on actual join/exit
+     * transitions. Banned counts as exit; unban as join. */
+    CarrierEventType ev_type;
+    switch (action) {
+        case 1: ev_type = CARRIER_EVENT_GROUP_PEER_JOIN; break;
+        case 4: ev_type = CARRIER_EVENT_GROUP_PEER_JOIN; break;
+        case 2: ev_type = CARRIER_EVENT_GROUP_PEER_EXIT; break;
+        case 3: ev_type = CARRIER_EVENT_GROUP_PEER_EXIT; break;
+        default: return;   /* 0 (add): not yet present, skip */
+    }
+
+    QueuedEvent qe;
+    stamp(qe.ev, ev_type);
+    set_account(qe.ev, accountId);
+    if (ev_type == CARRIER_EVENT_GROUP_PEER_JOIN) {
+        copy_fixed(qe.ev.group_peer_join.conversation_id,
+                   CARRIER_CONVERSATION_ID_LEN, conversationId);
+        copy_fixed(qe.ev.group_peer_join.member_uri,
+                   CARRIER_URI_LEN, memberUri);
+    } else {
+        copy_fixed(qe.ev.group_peer_exit.conversation_id,
+                   CARRIER_CONVERSATION_ID_LEN, conversationId);
+        copy_fixed(qe.ev.group_peer_exit.member_uri,
+                   CARRIER_URI_LEN, memberUri);
+    }
+    carrier_push_event(c, std::move(qe));
+}
+
+void on_conversation_sync_finished(Carrier *c,
+                                   const std::string &accountId)
+{
+    /* libjami's signal is account-scoped (no conversationId), so the
+     * emitted event carries no conversationId either. */
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_CONVERSATION_SYNC_FINISHED);
+    set_account(qe.ev, accountId);
+    qe.ev.conversation_sync_finished._placeholder = '\0';
+    carrier_push_event(c, std::move(qe));
+}
+
+void on_conversation_removed(Carrier *c,
+                             const std::string &accountId,
+                             const std::string &conversationId)
+{
+    /* No event surfaces yet (vocabulary doesn't define one). Drop the
+     * mode + peer caches so a fresh conversation by the same id reseeds
+     * cleanly. */
+    std::lock_guard<std::mutex> lock(c->accounts_mtx);
+    auto it = c->accounts.find(accountId);
+    if (it == c->accounts.end()) return;
+    it->second.conversation_modes.erase(conversationId);
+    for (auto pc = it->second.peer_conversations.begin();
+         pc != it->second.peer_conversations.end(); ) {
+        if (pc->second == conversationId) {
+            pc = it->second.peer_conversations.erase(pc);
+        } else {
+            ++pc;
+        }
+    }
 }
 
 } /* anonymous namespace */
@@ -294,6 +473,28 @@ void carrier_register_signals(Carrier *c)
     handlers.insert(exportable_callback<VS::ConversationReady>(
         [c](const std::string &accountId, const std::string &conversationId) {
             on_conversation_ready(c, accountId, conversationId);
+        }));
+
+    handlers.insert(exportable_callback<VS::ConversationRequestReceived>(
+        [c](const std::string &accountId, const std::string &conversationId,
+            std::map<std::string, std::string> metadatas) {
+            on_conversation_request_received(c, accountId, conversationId, metadatas);
+        }));
+
+    handlers.insert(exportable_callback<VS::ConversationMemberEvent>(
+        [c](const std::string &accountId, const std::string &conversationId,
+            const std::string &memberUri, int action) {
+            on_conversation_member_event(c, accountId, conversationId, memberUri, action);
+        }));
+
+    handlers.insert(exportable_callback<VS::ConversationSyncFinished>(
+        [c](const std::string &accountId) {
+            on_conversation_sync_finished(c, accountId);
+        }));
+
+    handlers.insert(exportable_callback<VS::ConversationRemoved>(
+        [c](const std::string &accountId, const std::string &conversationId) {
+            on_conversation_removed(c, accountId, conversationId);
         }));
 
     libjami::registerSignalHandlers(handlers);

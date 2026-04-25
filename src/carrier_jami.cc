@@ -179,6 +179,10 @@ void carrier_push_event(Carrier *c, QueuedEvent &&qe)
                 q.ev.text_message.text = q.message_text.c_str();
                 q.ev.text_message.text_len = q.message_text.size();
                 break;
+            case CARRIER_EVENT_GROUP_MESSAGE:
+                q.ev.group_message.text = q.message_text.c_str();
+                q.ev.group_message.text_len = q.message_text.size();
+                break;
             case CARRIER_EVENT_ERROR:
                 q.ev.error.text = q.message_text.c_str();
                 break;
@@ -374,6 +378,14 @@ extern "C" int carrier_load_account(Carrier *c, const char *account_id)
 {
     if (!c || !account_id) return -1;
 
+    /* carrier_new() passes LIBJAMI_FLAG_NO_AUTOLOAD so libjami doesn't pick
+     * up on-disk archives implicitly at init time — we want explicit
+     * lifecycle. With that flag set, getAccountDetails() returns empty for
+     * accounts that exist on disk but haven't been activated. Call
+     * loadAccountAndConversation first to materialize the account (and its
+     * conversations) before querying. */
+    libjami::loadAccountAndConversation(account_id, /*loadAll=*/true, /*convId=*/"");
+
     const auto details = libjami::getAccountDetails(account_id);
     if (details.empty()) {
         CLOG_WARN(c, "SHIM", "load_account: no such account %s", account_id);
@@ -509,4 +521,111 @@ extern "C" int carrier_send_message(Carrier    *c,
 
     libjami::sendMessage(account_id, convId, text, /*replyTo=*/"", /*flag=*/0);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Swarm conversations (multi-party)
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_create_conversation(Carrier    *c,
+                                           const char *account_id,
+                                           const char *privacy,
+                                           char        out_conversation_id[CARRIER_CONVERSATION_ID_LEN])
+{
+    if (!c || !account_id || !out_conversation_id) return -1;
+
+    /* libjami's public API only exposes startConversation(accountId), which
+     * defaults to ConversationMode::INVITES_ONLY. The internal
+     * convModule->startConversation(mode, otherMember) is private. Until the
+     * shim grows a path to the internal API, only "invites_only" (and NULL,
+     * which is treated as default) are honored. Other modes log a warning
+     * and fall through to invites_only. */
+    const std::string mode = (privacy && *privacy) ? privacy : "invites_only";
+    if (mode != "invites_only") {
+        CLOG_WARN(c, "SHIM",
+                  "create_conversation: privacy=%s not supported by public "
+                  "libjami API; using invites_only", mode.c_str());
+    }
+
+    const std::string conv_id = libjami::startConversation(account_id);
+    if (conv_id.empty()) {
+        emit_error(c, account_id, "CreateConversation", "LibjamiFailure",
+                   "startConversation returned empty id");
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        if (auto *acct = find_account(c, account_id)) {
+            acct->conversation_modes[conv_id] = "invites_only";
+        }
+    }
+
+    copy_to(out_conversation_id, CARRIER_CONVERSATION_ID_LEN, conv_id);
+    return 0;
+}
+
+extern "C" int carrier_send_conversation_message(Carrier    *c,
+                                                 const char *account_id,
+                                                 const char *conversation_id,
+                                                 const char *text)
+{
+    if (!c || !account_id || !conversation_id || !text) return -1;
+    libjami::sendMessage(account_id, conversation_id, text,
+                         /*replyTo=*/"", /*flag=*/0);
+    return 0;
+}
+
+extern "C" int carrier_accept_conversation_request(Carrier    *c,
+                                                   const char *account_id,
+                                                   const char *conversation_id)
+{
+    if (!c || !account_id || !conversation_id) return -1;
+    libjami::acceptConversationRequest(account_id, conversation_id);
+    return 0;
+}
+
+extern "C" int carrier_decline_conversation_request(Carrier    *c,
+                                                    const char *account_id,
+                                                    const char *conversation_id)
+{
+    if (!c || !account_id || !conversation_id) return -1;
+    libjami::declineConversationRequest(account_id, conversation_id);
+    return 0;
+}
+
+extern "C" int carrier_invite_to_conversation(Carrier    *c,
+                                              const char *account_id,
+                                              const char *conversation_id,
+                                              const char *contact_uri)
+{
+    if (!c || !account_id || !conversation_id || !contact_uri) return -1;
+    libjami::addConversationMember(account_id, conversation_id, contact_uri);
+    return 0;
+}
+
+extern "C" int carrier_remove_conversation(Carrier    *c,
+                                           const char *account_id,
+                                           const char *conversation_id)
+{
+    if (!c || !account_id || !conversation_id) return -1;
+    const bool ok = libjami::removeConversation(account_id, conversation_id);
+
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        if (auto *acct = find_account(c, account_id)) {
+            acct->conversation_modes.erase(conversation_id);
+            /* Drop any peer_conversations entry pointing at this id. */
+            for (auto it = acct->peer_conversations.begin();
+                 it != acct->peer_conversations.end(); ) {
+                if (it->second == conversation_id) {
+                    it = acct->peer_conversations.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    return ok ? 0 : -1;
 }
