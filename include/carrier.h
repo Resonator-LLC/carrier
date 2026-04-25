@@ -73,6 +73,7 @@ typedef struct Carrier Carrier;
 #define CARRIER_MESSAGE_ID_LEN        64  /* Swarm message commit hash (40 hex) + headroom */
 #define CARRIER_NAME_LEN             128  /* display name */
 #define CARRIER_REACTION_LEN          32  /* emoji grapheme cluster, generous cap */
+#define CARRIER_STATUS_LEN            16  /* presence status string ("online", "offline", ...) */
 
 /* ---------------------------------------------------------------------------
  * Event types
@@ -98,6 +99,7 @@ typedef enum {
     CARRIER_EVENT_CONVERSATION_SYNC_FINISHED, /* per-account: all swarms synced */
     CARRIER_EVENT_SWARM_COMMIT,             /* raw Swarm git commit (DAG-level view) */
     CARRIER_EVENT_REACTION,                 /* peer reacted to a Swarm message (M4) */
+    CARRIER_EVENT_PRESENCE,                 /* continuous presence update for a contact */
     CARRIER_EVENT_ERROR,                    /* command-level failure */
     CARRIER_EVENT_SYSTEM,                   /* operational notice */
 } CarrierEventType;
@@ -246,6 +248,16 @@ typedef struct {
             char contact_uri[CARRIER_URI_LEN];           /* reactor */
             char text[CARRIER_REACTION_LEN];             /* emoji */
         } reaction;
+
+        /* Continuous presence update for a subscribed contact. `status` is
+         * one of "online" or "offline" today; "away"/"busy" are reserved
+         * in the vocab for when libjami starts surfacing those line_status
+         * values. Fires after carrier_subscribe_presence has been called
+         * for `contact_uri`. */
+        struct {
+            char contact_uri[CARRIER_URI_LEN];
+            char status[CARRIER_STATUS_LEN];
+        } presence;
 
         /* A command was rejected. `command` is the RDF local name (e.g.
          * "SendTrustRequest") when triaged at the dispatch layer; otherwise
@@ -642,6 +654,32 @@ int carrier_send_reaction(Carrier    *c,
                           const char *conversation_id,
                           const char *message_id,
                           const char *reaction);
+
+/* ---------------------------------------------------------------------------
+ * Presence
+ *
+ * Continuous presence ("online"/"offline") for individual contacts, distinct
+ * from the binary CONTACT_ONLINE/CONTACT_OFFLINE pair which fires
+ * unconditionally on DHT reachability. carrier_subscribe_presence registers
+ * a buddy with libjami's PresenceManager; CARRIER_EVENT_PRESENCE fires on
+ * every status change thereafter. PresenceManager binds to OpenDHT, so the
+ * first event for a freshly-subscribed contact may take seconds.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Subscribe or unsubscribe from continuous presence updates for a contact.
+ *
+ * contact_uri: 40-hex Jami URI of the peer.
+ * subscribe:   true to begin subscription; false to stop it. Idempotent
+ *              in either direction — re-subscribing an already-subscribed
+ *              buddy is a no-op, as is unsubscribing one we don't know.
+ *
+ * Returns 0 on enqueue, -1 on validation failure (missing account, bad URI).
+ */
+int carrier_subscribe_presence(Carrier    *c,
+                               const char *account_id,
+                               const char *contact_uri,
+                               bool        subscribe);
 
 #ifdef __cplusplus
 } /* extern "C" */

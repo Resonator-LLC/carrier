@@ -262,6 +262,15 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             }
             break;
 
+        case CARRIER_EVENT_PRESENCE:
+            emit_header(out, "Presence", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->presence.contact_uri);
+            fprintf(out, "\" ; carrier:status \"");
+            turtle_escape(out, ev->presence.status);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_ERROR:
             emit_header(out, "Error", ev->account_id);
             fprintf(out, " ; carrier:command \"");

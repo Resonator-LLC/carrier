@@ -14,6 +14,7 @@
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
 #include <jami/conversation_interface.h>
+#include <jami/presencemanager_interface.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -649,5 +650,26 @@ extern "C" int carrier_send_reaction(Carrier    *c,
      * the ReactionAdded signal (see on_reaction_added). */
     libjami::sendMessage(account_id, conversation_id, reaction,
                          /*replyTo=*/message_id, /*flag=*/2);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Presence
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_subscribe_presence(Carrier    *c,
+                                          const char *account_id,
+                                          const char *contact_uri,
+                                          bool        subscribe)
+{
+    if (!c || !account_id || !contact_uri) {
+        return -1;
+    }
+    /* libjami::subscribeBuddy registers the buddy with the account's
+     * PresenceManager. Status changes thereafter surface via
+     * PresenceSignal::NewBuddyNotification (see on_presence_changed). The
+     * call is idempotent on libjami's side — re-subscribing a tracked buddy
+     * is a no-op aside from a fresh notification. */
+    libjami::subscribeBuddy(account_id, contact_uri, subscribe);
     return 0;
 }

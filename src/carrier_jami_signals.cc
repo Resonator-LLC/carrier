@@ -14,6 +14,7 @@
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
 #include <jami/conversation_interface.h>
+#include <jami/presencemanager_interface.h>
 
 #include <cstring>
 #include <map>
@@ -474,6 +475,26 @@ void on_conversation_removed(Carrier *c,
     }
 }
 
+void on_presence_changed(Carrier *c,
+                         const std::string &accountId,
+                         const std::string &buddyUri,
+                         int status,
+                         const std::string &/*line_status*/)
+{
+    /* libjami's PresenceState (jamidht/jamiaccount.h) is
+     *   DISCONNECTED = 0, AVAILABLE = 1, CONNECTED = 2.
+     * Anything > 0 is reachable; only DISCONNECTED is offline. We expose
+     * a binary "online"/"offline" today; "away"/"busy" are reserved in the
+     * vocab for when libjami starts surfacing line_status worth mapping. */
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_PRESENCE);
+    set_account(qe.ev, accountId);
+    copy_fixed(qe.ev.presence.contact_uri, CARRIER_URI_LEN, buddyUri);
+    std::string state = (status > 0) ? "online" : "offline";
+    copy_fixed(qe.ev.presence.status, CARRIER_STATUS_LEN, state);
+    carrier_push_event(c, std::move(qe));
+}
+
 } /* anonymous namespace */
 
 /* ---------------------------------------------------------------------------
@@ -487,6 +508,7 @@ void carrier_register_signals(Carrier *c)
     using libjami::exportable_callback;
     using CS  = libjami::ConfigurationSignal;
     using VS  = libjami::ConversationSignal;
+    using PS  = libjami::PresenceSignal;
 
     handlers.insert(exportable_callback<CS::RegistrationStateChanged>(
         [c](const std::string &accountId, const std::string &state,
@@ -550,6 +572,12 @@ void carrier_register_signals(Carrier *c)
             const std::string &messageId,
             std::map<std::string, std::string> reaction) {
             on_reaction_added(c, accountId, conversationId, messageId, reaction);
+        }));
+
+    handlers.insert(exportable_callback<PS::NewBuddyNotification>(
+        [c](const std::string &accountId, const std::string &buddyUri,
+            int status, const std::string &lineStatus) {
+            on_presence_changed(c, accountId, buddyUri, status, lineStatus);
         }));
 
     libjami::registerSignalHandlers(handlers);

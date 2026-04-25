@@ -392,6 +392,23 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- Presence --- */
+
+    if (strcmp(stmt->type, "SubscribePresence") == 0 ||
+        strcmp(stmt->type, "UnsubscribePresence") == 0) {
+        const char *account = require_account(c, stmt, stmt->type);
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, stmt->type, "MissingField",
+                               "carrier:contactUri required");
+            return 0;
+        }
+        bool subscribe = (strcmp(stmt->type, "SubscribePresence") == 0);
+        carrier_subscribe_presence(c, account, uri, subscribe);
+        return 0;
+    }
+
     /* --- Meta --- */
 
     if (strcmp(stmt->type, "Quit") == 0) {
