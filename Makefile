@@ -157,7 +157,7 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build apply-jami-patches
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
@@ -169,7 +169,23 @@ check-libjami:
 	    exit 1; \
 	fi
 
-libjami-build:
+# Apply local patches to the jami-daemon submodule. Idempotent: each patch is
+# applied only if `git apply --reverse --check` says it isn't already in place.
+# Patches live in patches/jami-daemon/*.patch and document deviations from the
+# pinned upstream commit (D19). Each one should have a header explaining why
+# the change exists and a note about whether an upstream PR is open.
+apply-jami-patches:
+	@for p in patches/jami-daemon/*.patch; do \
+	    [ -f "$$p" ] || continue; \
+	    if git -C $(JAMI_DIR) apply --reverse --check "$(CURDIR)/$$p" 2>/dev/null; then \
+	        echo "  PATCH skip $$p (already applied)"; \
+	    else \
+	        echo "  PATCH      $$p"; \
+	        git -C $(JAMI_DIR) apply "$(CURDIR)/$$p"; \
+	    fi; \
+	done
+
+libjami-build: apply-jami-patches
 	@echo "  CMAKE libjami (this may take 1-3 hours cold)..."
 	cd $(JAMI_DIR) && cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
 	cmake --build $(JAMI_DIR)/build -j$(NPROC)
