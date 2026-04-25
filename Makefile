@@ -1,17 +1,48 @@
-CC ?= cc
-AR ?= ar
+CC  ?= cc
+CXX ?= c++
+AR  ?= ar
 
 PREFIX ?= /usr/local
 
-# --- Toxcore (built from submodule) ---
-TOXCORE_DIR    = third_party/toxcore
-TOXCORE_BUILD  = $(TOXCORE_DIR)/build
-TOXCORE_PREFIX = $(CURDIR)/build/deps
-TOXCORE_INC    = $(TOXCORE_PREFIX)/include
-TOXCORE_LIB    = $(TOXCORE_PREFIX)/lib
-TOXCORE_STAMP  = $(TOXCORE_PREFIX)/.built
+# ---------------------------------------------------------------------------
+# Dependencies
+#
+# This Makefile assumes libjami (from the vendored submodule) has already
+# been built. The expected layout after a successful
+# `cmake --build third_party/jami-daemon/build` is:
+#
+#   third_party/jami-daemon/build/src/libjami.a         — the library
+#   third_party/jami-daemon/contrib/<host>/lib/*.a     — contrib deps
+#   third_party/jami-daemon/src/jami/*.h               — public headers
+#
+# See arch/jami-migration.md D18–D20 for why we vendor + build in place on
+# macOS instead of using a system package. Linux may grow a system-package
+# path here later (D17).
+# ---------------------------------------------------------------------------
 
-# --- Serd (compiled from submodule sources) ---
+JAMI_DIR           = third_party/jami-daemon
+JAMI_INC           = $(JAMI_DIR)/src
+JAMI_BUILD         = $(JAMI_DIR)/build
+JAMI_LIB           = $(JAMI_BUILD)/libjami-core.a
+
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+UNAME_R := $(shell uname -r)
+
+ifeq ($(UNAME_S), Darwin)
+JAMI_HOST_TRIPLE = $(UNAME_M)-apple-darwin$(UNAME_R)
+# pjsip names its libraries with the GNU arch convention (aarch64) while the
+# Apple contrib dir uses arm64. Everything else in contrib uses the Apple name.
+JAMI_PJ_TRIPLE   = $(subst arm64,aarch64,$(UNAME_M))-apple-darwin$(UNAME_R)
+else ifeq ($(UNAME_S), Linux)
+JAMI_HOST_TRIPLE = $(UNAME_M)-linux-gnu
+JAMI_PJ_TRIPLE   = $(JAMI_HOST_TRIPLE)
+endif
+
+JAMI_CONTRIB_LIB   = $(JAMI_DIR)/contrib/$(JAMI_HOST_TRIPLE)/lib
+JAMI_CONTRIB_INC   = $(JAMI_DIR)/contrib/$(JAMI_HOST_TRIPLE)/include
+
+# --- Serd (compiled from submodule sources; still C) ---
 SERD_DIR     = third_party/serd
 SERD_INC     = $(SERD_DIR)/include
 SERD_SRC_DIR = $(SERD_DIR)/src
@@ -20,118 +51,174 @@ SRC_DIR   = src
 BUILD_DIR = build
 INC_DIR   = include
 
-CFLAGS ?= -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-nullability-extension
-CFLAGS += -I$(INC_DIR) -I$(SRC_DIR) -I$(TOXCORE_INC) -I$(SERD_INC) -DSERD_STATIC
+# ---------------------------------------------------------------------------
+# Compile flags
+# ---------------------------------------------------------------------------
 
-LDFLAGS ?=
-LDFLAGS += -L$(TOXCORE_LIB) -ltoxcore
-LDFLAGS += $(shell pkg-config --libs libsodium opus vpx 2>/dev/null || echo "-lsodium -lopus -lvpx")
-LDFLAGS += -lpthread
+COMMON_WARN = -Wall -Wextra -Wno-unused-parameter -Wno-nullability-extension
+COMMON_INC  = -I$(INC_DIR) -I$(SRC_DIR) -I$(JAMI_INC) -I$(SERD_INC)
 
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S), Linux)
-LDFLAGS += -ldl -lrt
+CFLAGS   ?= -std=c11 -D_DEFAULT_SOURCE $(COMMON_WARN)
+CFLAGS   += $(COMMON_INC) -DSERD_STATIC
+
+CXXFLAGS ?= -std=c++20 $(COMMON_WARN)
+CXXFLAGS += $(COMMON_INC)
+
+# ---------------------------------------------------------------------------
+# Link flags
+#
+# libjami's transitive dep set is large; we link each contrib lib explicitly
+# because libjami does not yet export a cmake target we can consume.
+# Missing libs fail at link time with a clear message.
+# ---------------------------------------------------------------------------
+
+LDFLAGS  ?=
+LDFLAGS  += $(JAMI_LIB)
+
+JAMI_CONTRIB_LIBS = \
+    $(JAMI_CONTRIB_LIB)/libdhtnet.a \
+    $(JAMI_CONTRIB_LIB)/libopendht.a \
+    $(JAMI_CONTRIB_LIB)/libpjsua2-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjsua-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjsip-ua-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjsip-simple-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjsip-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjmedia-codec-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjmedia-audiodev-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjmedia-videodev-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjmedia-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjnath-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpjlib-util-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libpj-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libsrtp-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libyuv-$(JAMI_PJ_TRIPLE).a \
+    $(JAMI_CONTRIB_LIB)/libavformat.a \
+    $(JAMI_CONTRIB_LIB)/libavcodec.a \
+    $(JAMI_CONTRIB_LIB)/libavfilter.a \
+    $(JAMI_CONTRIB_LIB)/libavdevice.a \
+    $(JAMI_CONTRIB_LIB)/libswresample.a \
+    $(JAMI_CONTRIB_LIB)/libswscale.a \
+    $(JAMI_CONTRIB_LIB)/libavutil.a \
+    $(JAMI_CONTRIB_LIB)/libx264.a \
+    $(JAMI_CONTRIB_LIB)/libfmt.a \
+    $(JAMI_CONTRIB_LIB)/libhttp_parser.a \
+    $(JAMI_CONTRIB_LIB)/libllhttp.a \
+    $(JAMI_CONTRIB_LIB)/libnatpmp.a \
+    $(JAMI_CONTRIB_LIB)/libsimdutf.a \
+    $(JAMI_CONTRIB_LIB)/libixml.a \
+    $(JAMI_CONTRIB_LIB)/libupnp.a \
+    $(JAMI_CONTRIB_LIB)/libspeex.a \
+    $(JAMI_CONTRIB_LIB)/libspeexdsp.a \
+    $(JAMI_CONTRIB_LIB)/libminizip.a \
+    $(JAMI_CONTRIB_LIB)/libzstd.a \
+    $(JAMI_CONTRIB_LIB)/libbzip2.a \
+    $(JAMI_CONTRIB_LIB)/libsecp256k1.a \
+    $(JAMI_CONTRIB_LIB)/libyaml-cpp.a
+
+LDFLAGS += $(JAMI_CONTRIB_LIBS)
+
+# Homebrew-provided deps on macOS (GnuTLS, libgit2, jsoncpp, secp256k1, yaml-cpp)
+ifeq ($(UNAME_S), Darwin)
+LDFLAGS += $(shell pkg-config --libs gnutls nettle hogweed libgit2 jsoncpp vpx opus openssl libargon2 gmp 2>/dev/null)
+LDFLAGS += -framework AVFoundation -framework CoreAudio -framework CoreVideo -framework CoreMedia -framework CoreGraphics
+LDFLAGS += -framework VideoToolbox -framework AudioUnit -framework Foundation
+LDFLAGS += -framework CoreFoundation -framework Security -framework SystemConfiguration
+LDFLAGS += -lcompression -lresolv -lc++ -lz -liconv
 endif
+
+ifeq ($(UNAME_S), Linux)
+LDFLAGS += $(shell pkg-config --libs gnutls nettle hogweed libgit2 jsoncpp libsecp256k1 yaml-cpp openssl libargon2 gmp 2>/dev/null)
+LDFLAGS += -lstdc++ -ldl -lrt -lresolv -lz
+endif
+
+LDFLAGS += -lpthread
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Serd objects (Turtle parser library)
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+# Serd — plain C, compiled with warnings silenced.
 SERD_SRC = base64.c byte_source.c env.c n3.c node.c read_utf8.c reader.c \
            string.c system.c uri.c writer.c
 SERD_OBJ = $(addprefix $(BUILD_DIR)/serd_, $(SERD_SRC:.c=.o))
 SERD_CFLAGS = -std=c11 -w -I$(SERD_INC) -I$(SERD_SRC_DIR) -DSERD_STATIC
 
-# Library objects (no main)
-LIB_SRC = carrier.c carrier_events.c carrier_log.c
-LIB_OBJ = $(addprefix $(BUILD_DIR)/, $(LIB_SRC:.c=.o))
+# Library sources — mix of C++ (shim + internals that touch C++ state) and C.
+LIB_CXX_SRC = carrier_jami.cc carrier_jami_signals.cc carrier_events.cc carrier_log.cc
+LIB_CXX_OBJ = $(addprefix $(BUILD_DIR)/, $(LIB_CXX_SRC:.cc=.o))
 
-# CLI objects
+# CLI — still plain C (calls public C API only).
 CLI_SRC = main_cli.c turtle_parse.c turtle_emit.c
 CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 
-# Test objects (linked against turtle_emit.o only — no toxcore needed)
-TEST_SRC = $(wildcard tests/*.c)
-TEST_OBJ = $(addprefix $(BUILD_DIR)/, $(notdir $(TEST_SRC:.c=.o)))
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build
 
-all: $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
+all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
-# --- Toxcore build ---
+check-libjami:
+	@if [ ! -f "$(JAMI_LIB)" ]; then \
+	    echo "ERROR: $(JAMI_LIB) not found."; \
+	    echo "Build libjami first: make libjami-build"; \
+	    echo "(or: cd $(JAMI_DIR) && cmake -S . -B build && cmake --build build -j$(NPROC))"; \
+	    exit 1; \
+	fi
 
-$(TOXCORE_STAMP): | $(BUILD_DIR)
-	@echo "  CMAKE toxcore (this may take a minute)..."
-	@mkdir -p $(TOXCORE_BUILD)
-	@cd $(TOXCORE_BUILD) && cmake .. \
-		-DCMAKE_INSTALL_PREFIX=$(TOXCORE_PREFIX) \
-		-DBUILD_TOXAV=ON \
-		-DMUST_BUILD_TOXAV=ON \
-		-DENABLE_SHARED=OFF \
-		-DENABLE_STATIC=ON \
-		-DCMAKE_C_FLAGS="-w" \
-		> /dev/null 2>&1
-	@$(MAKE) -C $(TOXCORE_BUILD) -j$(NPROC) --no-print-directory > /dev/null 2>&1
-	@$(MAKE) -C $(TOXCORE_BUILD) install --no-print-directory > /dev/null 2>&1
-	@touch $@
+libjami-build:
+	@echo "  CMAKE libjami (this may take 1-3 hours cold)..."
+	cd $(JAMI_DIR) && cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
+	cmake --build $(JAMI_DIR)/build -j$(NPROC)
 
-deps: $(TOXCORE_STAMP)
+deps: libjami-build
 
-# --- Static library (includes serd) ---
-
-$(BUILD_DIR)/libcarrier.a: $(LIB_OBJ) $(SERD_OBJ)
+# --- Static library ---
+$(BUILD_DIR)/libcarrier.a: $(LIB_CXX_OBJ) $(SERD_OBJ)
 	@echo "  AR    $(@F)"
 	@$(AR) rcs $@ $^
 
 # --- CLI binary ---
-
 $(BUILD_DIR)/carrier-cli: $(CLI_OBJ) $(BUILD_DIR)/libcarrier.a
 	@echo "  LD    $(@F)"
-	@$(CC) $(CFLAGS) -o $@ $(CLI_OBJ) $(BUILD_DIR)/libcarrier.a $(LDFLAGS)
+	@$(CXX) $(CXXFLAGS) -o $@ $(CLI_OBJ) $(BUILD_DIR)/libcarrier.a $(LDFLAGS)
 
-# Carrier sources depend on toxcore headers
-$(LIB_OBJ): $(TOXCORE_STAMP)
-$(CLI_OBJ): $(TOXCORE_STAMP)
-
-# Compile carrier sources
+# --- Compile rules ---
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	@echo "  CC    $(<F)"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
-# Compile serd sources
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cc | $(BUILD_DIR)
+	@echo "  CXX   $(<F)"
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
+
 $(BUILD_DIR)/serd_%.o: $(SERD_SRC_DIR)/%.c | $(BUILD_DIR)
 	@echo "  CC    serd/$(<F)"
 	@$(CC) $(SERD_CFLAGS) -c -o $@ $<
 
-# Compile test sources
-$(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR)
-	@echo "  CC    tests/$(<F)"
-	@$(CC) $(CFLAGS) -Itests -I$(SRC_DIR) -c -o $@ $<
-
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-# --- Test (no toxcore dependency) ---
-
-$(BUILD_DIR)/test_carrier: $(TEST_OBJ) $(BUILD_DIR)/turtle_emit.o
-	@echo "  LD    $(@F)"
-	@$(CC) $(CFLAGS) -o $@ $(TEST_OBJ) $(BUILD_DIR)/turtle_emit.o
-
-test: $(BUILD_DIR)/test_carrier
-	@echo "  TEST  running tests..."
-	@$(BUILD_DIR)/test_carrier
+# --- Tests (rewritten for v2 in a later task) ---
+test:
+	@echo "Tests need rewrite for Jami-backed carrier; see arch/jami-migration.md M2/M3."
+	@exit 1
 
 # --- Sanitizers ---
-
 asan: clean
-	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g" \
-		LDFLAGS="$(LDFLAGS) -fsanitize=address"
+	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer -g" \
+	        CFLAGS="$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g" \
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address"
 
 tsan: clean
-	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread -g" \
-		LDFLAGS="$(LDFLAGS) -fsanitize=thread"
+	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fsanitize=thread -g" \
+	        CFLAGS="$(CFLAGS) -fsanitize=thread -g" \
+	        LDFLAGS="$(LDFLAGS) -fsanitize=thread"
 
 # --- Install ---
-
 install: all
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -d $(DESTDIR)$(PREFIX)/include
@@ -143,7 +230,7 @@ install: all
 	install -m 755 $(BUILD_DIR)/carrier-cli $(DESTDIR)$(PREFIX)/bin/
 	install -m 644 man/carrier-cli.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	sed -e 's|@PREFIX@|$(PREFIX)|g' \
-	    -e 's|@VERSION@|2.0.0|g' \
+	    -e 's|@VERSION@|3.0.0|g' \
 	    carrier.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/carrier.pc
 
 uninstall:
@@ -154,8 +241,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/carrier-cli.1
 
 clean:
-	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli $(BUILD_DIR)/test_carrier
+	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
-distclean:
-	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli $(BUILD_DIR)/test_carrier
-	rm -rf $(TOXCORE_BUILD) $(TOXCORE_PREFIX)
+distclean: clean
+	rm -rf $(JAMI_BUILD)

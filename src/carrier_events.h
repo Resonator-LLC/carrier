@@ -1,6 +1,8 @@
 /*  carrier_events.h
  *
- *  Internal event helpers for Carrier.
+ *  Internal event-emission helpers. C-compatible so Turtle-layer TUs
+ *  (turtle_parse.c) can call into them. Implementation lives in
+ *  carrier_events.cc and does need C++ internals.
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
@@ -10,19 +12,23 @@
 #define CARRIER_EVENTS_H
 
 #include "carrier.h"
-#include "carrier_internal.h"
 
-/* Emit an event to the registered callback. Thread-safe. */
-void carrier_emit(Carrier *c, const CarrierEvent *event);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* Convenience emitters for common events */
+/* Enqueue a formatted SYSTEM event. Thread-safe. */
 void carrier_emit_system(Carrier *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-void carrier_emit_error(Carrier *c, const char *cmd, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+/* Enqueue a formatted ERROR event. `command` and `klass` may be NULL.
+ * Thread-safe. */
+void carrier_emit_error(Carrier *c, const char *command, const char *klass,
+                        const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
 
-void carrier_emit_connected(Carrier *c, int transport);
-void carrier_emit_disconnected(Carrier *c);
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* CARRIER_EVENTS_H */

@@ -1,21 +1,46 @@
 /*  carrier.h
  *
- *  Carrier — Cross-platform C library for the Tox protocol.
+ *  Carrier — Cross-platform C library for P2P transport.
  *  Part of the Resonator project.
  *
  *  Copyright (c) 2026-2027 Resonator LLC
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
+ *
+ *  ---------------------------------------------------------------------------
+ *  Backend: libjami (Jami Euclid 16.x). The shim lives in src/carrier_jami.cc
+ *  and src/carrier_jami_signals.cc. See arch/jami-migration.md for the full
+ *  migration plan; decisions D1–D20 are the load-bearing context.
+ *
+ *  M2 scope (this header): lifecycle, account creation/loading, self-ID,
+ *  trust requests, and 1:1 text messaging. Groups / multi-party Swarms come
+ *  in M3; calls, files, reactions, device-linking, continuous presence in M4.
+ *  Functions and event types are added in later milestones as they land —
+ *  there are no forward-declared placeholders for unimplemented surface.
+ *
+ *  Threading: libjami signals fire on daemon worker threads. The shim
+ *  marshals them into a bounded queue + clock fd (eventfd on Linux, self-pipe
+ *  on macOS); `carrier_iterate()` drains the queue on the caller's thread, so
+ *  the event callback always runs on the thread that called `carrier_iterate`.
+ *  This preserves Antenna's single-threaded-callback invariant (see D6).
+ *
+ *  Accounts: one `Carrier*` per process (libjami is process-scoped), but a
+ *  `Carrier*` may hold multiple accounts; every account-scoped API call takes
+ *  an `account_id`. Accounts are provisioned asynchronously — a successful
+ *  `carrier_create_account`/`carrier_load_account` call schedules the work,
+ *  and the caller waits for `CARRIER_EVENT_ACCOUNT_READY` (or
+ *  `CARRIER_EVENT_ACCOUNT_ERROR`) before sending messages (D7, D8).
+ *  ---------------------------------------------------------------------------
  */
 
 #ifndef CARRIER_H
 #define CARRIER_H
 
-#define CARRIER_VERSION_MAJOR 2
+#define CARRIER_VERSION_MAJOR 3
 #define CARRIER_VERSION_MINOR 0
 #define CARRIER_VERSION_PATCH 0
-#define CARRIER_VERSION_STRING "2.0.0"
+#define CARRIER_VERSION_STRING "3.0.0-dev"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -28,203 +53,127 @@ extern "C" {
 typedef struct Carrier Carrier;
 
 /* ---------------------------------------------------------------------------
+ * Fixed-buffer sizes for inline event fields.
+ *
+ * Long-form bodies (message text, trust-request payloads, error text) are
+ * passed as `const char *` pointers scoped to the callback invocation; the
+ * caller must copy them to persist beyond the callback.
+ * ---------------------------------------------------------------------------*/
+
+#define CARRIER_URI_LEN              128  /* "jami:<40hex>" or SIP URI, with headroom */
+#define CARRIER_ACCOUNT_ID_LEN        64  /* libjami internal account handle */
+#define CARRIER_CONVERSATION_ID_LEN   64  /* Swarm commit hash (40 hex) + headroom */
+#define CARRIER_NAME_LEN             128  /* display name */
+
+/* ---------------------------------------------------------------------------
  * Event types
  * ---------------------------------------------------------------------------*/
 
 typedef enum {
-    CARRIER_EVENT_CONNECTED,
-    CARRIER_EVENT_DISCONNECTED,
-    CARRIER_EVENT_SELF_ID,
-    CARRIER_EVENT_TEXT_MESSAGE,
-    CARRIER_EVENT_MESSAGE_SENT,
-    CARRIER_EVENT_FRIEND_REQUEST,
-    CARRIER_EVENT_FRIEND_ONLINE,
-    CARRIER_EVENT_FRIEND_OFFLINE,
-    CARRIER_EVENT_NICK,
-    CARRIER_EVENT_STATUS,
-    CARRIER_EVENT_STATUS_MESSAGE,
-    CARRIER_EVENT_GROUP_MESSAGE,
-    CARRIER_EVENT_GROUP_PEER_JOIN,
-    CARRIER_EVENT_GROUP_PEER_EXIT,
-    CARRIER_EVENT_GROUP_INVITE,
-    CARRIER_EVENT_GROUP_SELF_JOIN,
-    CARRIER_EVENT_CONFERENCE_MESSAGE,
-    CARRIER_EVENT_CONFERENCE_INVITE,
-    CARRIER_EVENT_FILE_TRANSFER,
-    CARRIER_EVENT_FILE_SEND_STARTED,
-    CARRIER_EVENT_FILE_PROGRESS,
-    CARRIER_EVENT_FILE_COMPLETE,
-    CARRIER_EVENT_CALL,
-    CARRIER_EVENT_CALL_STATE,
-    CARRIER_EVENT_AUDIO_FRAME,
-    CARRIER_EVENT_VIDEO_FRAME,
-    CARRIER_EVENT_PIPE,
-    CARRIER_EVENT_PIPE_DATA,
-    CARRIER_EVENT_PIPE_EOF,
-    CARRIER_EVENT_DHT_INFO,
-    CARRIER_EVENT_ERROR,
-    CARRIER_EVENT_SYSTEM,
+    CARRIER_EVENT_CONNECTED,         /* libjami daemon up, account registered */
+    CARRIER_EVENT_DISCONNECTED,      /* account lost registration */
+    CARRIER_EVENT_ACCOUNT_READY,     /* account reached REGISTERED; safe to send */
+    CARRIER_EVENT_ACCOUNT_ERROR,     /* registration failed; see `cause` */
+    CARRIER_EVENT_SELF_ID,           /* response to carrier_get_id() */
+    CARRIER_EVENT_TRUST_REQUEST,     /* peer sent us a trust request */
+    CARRIER_EVENT_CONTACT_ONLINE,    /* peer reachable on the DHT */
+    CARRIER_EVENT_CONTACT_OFFLINE,   /* peer unreachable */
+    CARRIER_EVENT_CONTACT_NAME,      /* peer published a display name */
+    CARRIER_EVENT_TEXT_MESSAGE,      /* inbound 1:1 text message */
+    CARRIER_EVENT_MESSAGE_SENT,      /* status update for an outbound message */
+    CARRIER_EVENT_ERROR,             /* command-level failure */
+    CARRIER_EVENT_SYSTEM,            /* operational notice */
 } CarrierEventType;
 
 /* ---------------------------------------------------------------------------
  * Event data
  * ---------------------------------------------------------------------------*/
 
-#define CARRIER_MAX_NAME_LENGTH     128
-#define CARRIER_MAX_MESSAGE_LENGTH  4096
-#define CARRIER_MAX_ID_LENGTH       128
-#define CARRIER_MAX_KEY_LENGTH      128
-
 typedef struct {
     CarrierEventType type;
-    int64_t timestamp;
+    int64_t timestamp;  /* CLOCK_REALTIME ms */
 
+    /* Account that fired the event. Empty string for non-account events
+     * (SYSTEM, and ERROR when the command had no account context). */
+    char account_id[CARRIER_ACCOUNT_ID_LEN];
+
+    /* CONNECTED and DISCONNECTED carry only the outer `account_id` and have
+     * no union arm. All other events populate the union. */
     union {
-        struct { int transport; } connected;
+        /* Fires when RegistrationStateChanged reaches REGISTERED. */
+        struct {
+            char self_uri[CARRIER_URI_LEN];     /* this account's 40-hex Jami ID */
+            char display_name[CARRIER_NAME_LEN];
+        } account_ready;
 
-        struct { char id[CARRIER_MAX_ID_LENGTH]; } self_id;
+        /* Fires when registration fails or the account is unrecoverable. */
+        struct {
+            const char *cause;  /* libjami error string, callback-scoped */
+        } account_error;
+
+        /* Answer to carrier_get_id(). */
+        struct {
+            char self_uri[CARRIER_URI_LEN];
+        } self_id;
+
+        /* Inbound trust request. Reply via carrier_accept_trust_request
+         * or carrier_discard_trust_request. */
+        struct {
+            char from_uri[CARRIER_URI_LEN];
+            const char *payload;   /* VCard / greeting, callback-scoped, may be NULL */
+            size_t      payload_len;
+        } trust_request;
 
         struct {
-            uint32_t friend_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-            char text[CARRIER_MAX_MESSAGE_LENGTH];
+            char contact_uri[CARRIER_URI_LEN];
+        } contact_online;
+
+        struct {
+            char contact_uri[CARRIER_URI_LEN];
+        } contact_offline;
+
+        struct {
+            char contact_uri[CARRIER_URI_LEN];
+            char display_name[CARRIER_NAME_LEN];
+        } contact_name;
+
+        /* Inbound 1:1 text message. At M2, Swarm conversations are an
+         * implementation detail of 1:1 messaging — `conversation_id` is
+         * surfaced so M3+ callers (who address Swarms directly) see the
+         * same field on both paths. */
+        struct {
+            char        contact_uri[CARRIER_URI_LEN];
+            char        conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            uint64_t    message_id;   /* libjami message handle */
+            const char *text;         /* UTF-8, callback-scoped, not NUL-bounded */
+            size_t      text_len;
         } text_message;
 
-        struct { uint32_t friend_id; uint32_t receipt; } message_sent;
-
+        /* Delivery status update for an outbound message.
+         * `status` values mirror libjami's MessageStates enum:
+         *   0 UNKNOWN, 1 SENDING, 2 SENT, 3 READ, 4 FAILURE, 5 CANCELLED. */
         struct {
-            uint32_t request_id;
-            char key[CARRIER_MAX_KEY_LENGTH];
-            char message[CARRIER_MAX_MESSAGE_LENGTH];
-        } friend_request;
+            char     contact_uri[CARRIER_URI_LEN];
+            char     conversation_id[CARRIER_CONVERSATION_ID_LEN];
+            uint64_t message_id;
+            int      status;
+        } message_sent;
 
+        /* A command was rejected. `command` is the RDF local name (e.g.
+         * "SendTrustRequest") when triaged at the dispatch layer; otherwise
+         * an internal tag. `class_` is a short symbolic category (e.g.
+         * "NotTrusted", "NoSuchAccount", "InvalidUri"); `text` is human-
+         * readable. */
         struct {
-            uint32_t friend_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-        } friend_online;
-
-        struct { uint32_t friend_id; } friend_offline;
-
-        struct {
-            uint32_t friend_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-        } nick;
-
-        struct {
-            uint32_t friend_id;
-            int status;
-        } status;
-
-        struct {
-            uint32_t friend_id;
-            char text[CARRIER_MAX_MESSAGE_LENGTH];
-        } status_message;
-
-        struct {
-            uint32_t group_id;
-            uint32_t peer_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-            char text[CARRIER_MAX_MESSAGE_LENGTH];
-        } group_message;
-
-        struct {
-            uint32_t group_id;
-            uint32_t peer_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-        } group_peer_join;
-
-        struct {
-            uint32_t group_id;
-            uint32_t peer_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-        } group_peer_exit;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t group_id;
-            char name[CARRIER_MAX_NAME_LENGTH];
-        } group_invite;
-
-        struct { uint32_t group_id; } group_self_join;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t file_id;
-            uint64_t file_size;
-            char filename[CARRIER_MAX_NAME_LENGTH];
-        } file_transfer;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t file_id;
-            uint64_t file_size;
-            char filename[CARRIER_MAX_NAME_LENGTH];
-        } file_send_started;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t file_id;
-            double progress;
-            uint64_t bytes_transferred;
-            bool outbound;
-        } file_progress;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t file_id;
-            bool outbound;
-            bool cancelled;
-        } file_complete;
-
-        struct {
-            uint32_t friend_id;
-            bool audio;
-            bool video;
-        } call;
-
-        struct {
-            uint32_t friend_id;
-            uint32_t state;
-        } call_state;
-
-        struct {
-            uint32_t friend_id;
-            const int16_t *pcm;
-            size_t samples;
-            uint8_t channels;
-            uint32_t sample_rate;
-        } audio_frame;
-
-        struct {
-            uint32_t friend_id;
-            uint16_t width;
-            uint16_t height;
-            const uint8_t *y;
-            const uint8_t *u;
-            const uint8_t *v;
-        } video_frame;
-
-        struct { uint32_t friend_id; } pipe;
-
-        struct {
-            uint32_t friend_id;
-            const uint8_t *data;
-            size_t len;
-        } pipe_data;
-
-        struct { uint32_t friend_id; } pipe_eof;
-
-        struct {
-            char key[CARRIER_MAX_KEY_LENGTH];
-            uint16_t port;
-        } dht_info;
-
-        struct { char text[CARRIER_MAX_MESSAGE_LENGTH]; } system;
-
-        struct {
-            char cmd[64];
-            char text[CARRIER_MAX_MESSAGE_LENGTH];
+            char        command[64];
+            char        class_[64];
+            const char *text;   /* callback-scoped */
         } error;
+
+        /* Operational notice (startup banner, shutdown, etc.). */
+        struct {
+            const char *text;   /* callback-scoped */
+        } system;
     };
 } CarrierEvent;
 
@@ -257,7 +206,7 @@ typedef enum {
 typedef struct {
     CarrierLogLevel level;
     int64_t         timestamp_ms;                  /* CLOCK_REALTIME ms */
-    char            tag[CARRIER_LOG_TAG_LEN];      /* e.g. "TOX", "DHT" */
+    char            tag[CARRIER_LOG_TAG_LEN];      /* e.g. "JAMI", "DHT", "SHIM" */
     char            message[CARRIER_LOG_MESSAGE_LEN]; /* single-line, no trailing newline */
 } CarrierLogRecord;
 
@@ -270,53 +219,66 @@ typedef void (*carrier_log_cb)(const CarrierLogRecord *record, void *userdata);
 /*
  * Create a new Carrier instance.
  *
- * profile_path: path to .tox profile file (created if doesn't exist)
- * config_path:  path to config file, or NULL for defaults
- * nodes_path:   path to DHT nodes JSON file, or NULL to skip bootstrap
- * log_cb:       log sink, or NULL to disable logging entirely.
- *               Captures records emitted during construction itself
- *               (e.g. tox_new failures, initial bootstrap).
+ * data_dir:     absolute path where libjami stores account archives and
+ *               conversation history. The shim exports XDG_DATA_HOME=data_dir
+ *               before calling libjami::init() so account data lands under
+ *               this tree (D11). Pass NULL to accept the platform default
+ *               (macOS: ~/Library/Application Support/jami; Linux:
+ *               $XDG_DATA_HOME/jami).
+ * log_cb:       log sink, or NULL to disable logging entirely. Captures
+ *               records emitted during construction itself (e.g. libjami
+ *               init failures, initial bootstrap).
  * log_userdata: opaque pointer passed back to log_cb on every record.
  *
- * Default log level after construction is CARRIER_LOG_DEBUG — all records
- * flow to the callback. The callback is expected to filter (embedders
- * typically delegate to their own logger, e.g. Antenna's tracing). Call
- * carrier_set_log_level() to gate records before they reach the callback.
+ * Default log level after construction is CARRIER_LOG_ERROR — the callback
+ * sees errors only. Call carrier_set_log_level() to widen the filter.
  *
- * Returns NULL on failure.
+ * On return, libjami is initialized and its signal handlers are registered,
+ * but no account is loaded. Call carrier_create_account() or
+ * carrier_load_account() next.
+ *
+ * One `Carrier*` per process. Returns NULL on libjami::init() failure.
  */
-Carrier *carrier_new(const char *profile_path,
-                     const char *config_path,
-                     const char *nodes_path,
+Carrier *carrier_new(const char    *data_dir,
                      carrier_log_cb log_cb,
                      void          *log_userdata);
 
 /*
  * Free a Carrier instance and all associated resources.
- * Saves the profile before shutting down.
+ * Account archives are auto-persisted by libjami; no explicit save needed.
  */
 void carrier_free(Carrier *c);
 
 /*
- * Process Tox events. Must be called periodically.
+ * Drain the event queue onto the caller's thread, invoking the event
+ * callback per event. Must be called periodically, or whenever
+ * carrier_clock_fd() becomes readable.
  * Returns 0 on success, -1 on error.
  */
 int carrier_iterate(Carrier *c);
 
 /*
- * Suggested interval (in ms) between carrier_iterate() calls.
+ * Conservative failsafe interval (in ms) between carrier_iterate() calls
+ * when the caller is not using the clock fd. Typical: ~5000.
  */
 int carrier_iteration_interval(Carrier *c);
 
+/*
+ * Read-end of a self-pipe (macOS) or eventfd (Linux) that becomes readable
+ * when the event queue is non-empty. Intended for poll()-based event loops
+ * that want zero-idle-CPU wakeups instead of a polling timer.
+ *
+ * The caller must drain the fd (or call carrier_iterate, which drains it)
+ * after each wake to reset the signal. Returns -1 if the fd is unavailable
+ * (e.g. in degraded init).
+ */
+int carrier_clock_fd(Carrier *c);
+
 /* ---------------------------------------------------------------------------
- * Event subscription
+ * Event & log callback configuration
  * ---------------------------------------------------------------------------*/
 
 void carrier_set_event_callback(Carrier *c, carrier_event_cb cb, void *userdata);
-
-/* ---------------------------------------------------------------------------
- * Log configuration
- * ---------------------------------------------------------------------------*/
 
 /* Register (or clear) the log sink. NULL cb disables all logging. */
 void carrier_set_log_callback(Carrier *c, carrier_log_cb cb, void *userdata);
@@ -326,92 +288,139 @@ void carrier_set_log_callback(Carrier *c, carrier_log_cb cb, void *userdata);
 void carrier_set_log_level(Carrier *c, CarrierLogLevel level);
 
 /* ---------------------------------------------------------------------------
- * Identity & status
- * ---------------------------------------------------------------------------*/
-
-int carrier_get_id(Carrier *c);
-int carrier_get_dht_info(Carrier *c);
-int carrier_bootstrap(Carrier *c, const char *host, uint16_t port,
-                      const char *key_hex);
-int carrier_set_nick(Carrier *c, const char *nick);
-int carrier_set_status(Carrier *c, int status);
-int carrier_set_status_message(Carrier *c, const char *msg);
-
-/* ---------------------------------------------------------------------------
- * Friends
- * ---------------------------------------------------------------------------*/
-
-int carrier_add_friend(Carrier *c, const char *tox_id, const char *message);
-int carrier_accept_friend(Carrier *c, uint32_t request_id);
-int carrier_decline_friend(Carrier *c, uint32_t request_id);
-int carrier_delete_friend(Carrier *c, uint32_t friend_id);
-int carrier_send_message(Carrier *c, uint32_t friend_id, const char *text);
-
-/* ---------------------------------------------------------------------------
- * File transfers
- * ---------------------------------------------------------------------------*/
-
-int carrier_send_file(Carrier *c, uint32_t friend_id, const char *path);
-int carrier_accept_file(Carrier *c, uint32_t friend_id, uint32_t file_id,
-                        const char *save_path);
-int carrier_cancel_file(Carrier *c, uint32_t friend_id, uint32_t file_id);
-
-/* ---------------------------------------------------------------------------
- * Groups
- * ---------------------------------------------------------------------------*/
-
-int carrier_create_group(Carrier *c, const char *name, bool is_public);
-int carrier_join_group(Carrier *c, uint32_t friend_id);
-int carrier_leave_group(Carrier *c, uint32_t group_id);
-int carrier_send_group_message(Carrier *c, uint32_t group_id, const char *text);
-int carrier_invite_to_group(Carrier *c, uint32_t group_id, uint32_t friend_id);
-
-/* ---------------------------------------------------------------------------
- * Audio/Video calls (signaling + raw PCM/frames, no hardware access)
- * ---------------------------------------------------------------------------*/
-
-int carrier_call(Carrier *c, uint32_t friend_id, bool audio, bool video);
-int carrier_answer(Carrier *c, uint32_t friend_id, bool audio, bool video);
-int carrier_hangup(Carrier *c, uint32_t friend_id);
-
-int carrier_send_audio(Carrier *c, uint32_t friend_id,
-                       const int16_t *pcm, size_t samples,
-                       uint8_t channels, uint32_t sample_rate);
-
-int carrier_send_video(Carrier *c, uint32_t friend_id,
-                       const uint8_t *y, const uint8_t *u, const uint8_t *v,
-                       uint16_t width, uint16_t height);
-
-int carrier_set_audio_bitrate(Carrier *c, uint32_t friend_id, uint32_t bitrate);
-int carrier_set_video_bitrate(Carrier *c, uint32_t friend_id, uint32_t bitrate);
-
-/* ---------------------------------------------------------------------------
- * Pipe mode (raw bidirectional data over Tox lossless packets)
+ * Accounts
+ *
+ * Account provisioning is asynchronous. These calls enqueue the work with
+ * libjami and return immediately; the caller waits for
+ * CARRIER_EVENT_ACCOUNT_READY (success) or CARRIER_EVENT_ACCOUNT_ERROR
+ * (failure) before issuing account-scoped API calls.
  * ---------------------------------------------------------------------------*/
 
 /*
- * Open a pipe to a friend. Incoming data arrives as CARRIER_EVENT_PIPE_DATA,
- * EOF as CARRIER_EVENT_PIPE_EOF.
+ * Create a fresh Jami account (new keypair, new 40-hex URI).
+ *
+ * display_name:    human-readable name; published to contacts. May be NULL
+ *                  or "" to leave unset.
+ * out_account_id:  buffer receiving the newly-assigned libjami account ID,
+ *                  NUL-terminated. Must be at least CARRIER_ACCOUNT_ID_LEN
+ *                  bytes. Populated synchronously before this call returns.
+ *
+ * The AccountReady event (once it fires) will carry this account_id in the
+ * outer struct and the new self URI in `account_ready.self_uri`.
+ *
+ * Returns 0 on success, -1 on failure (check log for libjami cause).
  */
-int carrier_pipe_open(Carrier *c, uint32_t friend_id);
+int carrier_create_account(Carrier    *c,
+                           const char *display_name,
+                           char        out_account_id[CARRIER_ACCOUNT_ID_LEN]);
 
 /*
- * Send raw bytes through the pipe. Automatically chunked to fit
- * lossless packet size limits. Returns bytes sent, or -1 on error.
+ * Attach an existing account that is already on disk under data_dir.
+ *
+ * account_id: the libjami account handle returned by a prior
+ *             carrier_create_account call (or recorded from an earlier
+ *             session).
+ *
+ * Same async semantics as carrier_create_account.
+ *
+ * Returns 0 on success, -1 if no such account exists under data_dir.
  */
-int carrier_pipe_write(Carrier *c, uint32_t friend_id,
-                       const uint8_t *data, size_t len);
-
-/*
- * Signal EOF — no more data will be sent on this pipe.
- */
-int carrier_pipe_close(Carrier *c, uint32_t friend_id);
+int carrier_load_account(Carrier *c, const char *account_id);
 
 /* ---------------------------------------------------------------------------
- * Profile persistence
+ * Identity & presence
  * ---------------------------------------------------------------------------*/
 
-int carrier_save(Carrier *c);
+/*
+ * Request the self URI for an account. Fires CARRIER_EVENT_SELF_ID.
+ * Returns 0 on enqueue, -1 if account_id is unknown.
+ *
+ * (Callers that already have the self URI from AccountReady do not need
+ * to call this — it exists so RDF-level `carrier:GetId` still round-trips.)
+ */
+int carrier_get_id(Carrier *c, const char *account_id);
+
+/*
+ * Update the account's published display name. Propagates to contacts on
+ * next presence refresh. Returns 0/-1.
+ */
+int carrier_set_nick(Carrier *c, const char *account_id, const char *nick);
+
+/* ---------------------------------------------------------------------------
+ * Trust (contacts)
+ *
+ * Jami contacts are established via a two-sided trust exchange: one side
+ * calls carrier_send_trust_request, the other sees CARRIER_EVENT_TRUST_REQUEST
+ * and replies with carrier_accept_trust_request (or carrier_discard_trust_request).
+ * Only after mutual trust does 1:1 messaging succeed (D10).
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Send a trust request to `contact_uri`.
+ *
+ * message: optional human-readable greeting embedded in the request
+ *          payload. May be NULL or "".
+ *
+ * Returns 0 on enqueue, -1 on invalid URI / unknown account.
+ */
+int carrier_send_trust_request(Carrier    *c,
+                               const char *account_id,
+                               const char *contact_uri,
+                               const char *message);
+
+/*
+ * Accept an inbound trust request from `contact_uri`. After this call,
+ * libjami creates a 1:1 Swarm between the two parties (emits
+ * ConversationReady on the shim's internal channel; not surfaced until M3).
+ */
+int carrier_accept_trust_request(Carrier    *c,
+                                 const char *account_id,
+                                 const char *contact_uri);
+
+/*
+ * Reject an inbound trust request from `contact_uri`. Silently drops it;
+ * the sender is not notified.
+ */
+int carrier_discard_trust_request(Carrier    *c,
+                                  const char *account_id,
+                                  const char *contact_uri);
+
+/*
+ * Remove an established contact. Matches libjami `removeContact(..., ban=false)`;
+ * banning is deferred until a real use case demands it.
+ */
+int carrier_remove_contact(Carrier    *c,
+                           const char *account_id,
+                           const char *contact_uri);
+
+/* ---------------------------------------------------------------------------
+ * Messaging (1:1)
+ *
+ * Under the hood, 1:1 Jami messages travel over a one_to_one Swarm. The
+ * shim resolves `(account_id, contact_uri) → conversation_id` via a cache
+ * seeded from libjami's getConversations() on account load; on cache miss
+ * it creates the 1:1 Swarm (requires pre-existing trust).
+ *
+ * Direct Swarm addressing (carrier_send_conversation_message, group Swarms)
+ * arrives in M3.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Send a 1:1 text message to `contact_uri`. Fails if no trust relationship
+ * is established — the caller must send (and have accepted) a trust request
+ * first.
+ *
+ * Delivery status is reported asynchronously via CARRIER_EVENT_MESSAGE_SENT,
+ * correlated by the libjami message_id that libjami assigns.
+ *
+ * Returns 0 on enqueue, -1 on immediate validation failure (invalid URI,
+ * unknown account, not trusted). The NotTrusted case also emits
+ * CARRIER_EVENT_ERROR with class "NotTrusted" for dispatch symmetry.
+ */
+int carrier_send_message(Carrier    *c,
+                         const char *account_id,
+                         const char *contact_uri,
+                         const char *text);
 
 #ifdef __cplusplus
 } /* extern "C" */

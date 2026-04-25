@@ -1,6 +1,6 @@
 /*  turtle_emit.c
  *
- *  Serialize CarrierEvents to compact RDF Turtle (one line per statement).
+ *  Serialize v2 CarrierEvents to compact RDF Turtle (one statement per event).
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
@@ -13,21 +13,29 @@
 #include <string.h>
 #include <time.h>
 
-/* Escape a string for Turtle literal: replace \ with \\ and " with \" */
+/* Escape a string for a Turtle literal: \, ", \n, \r. */
 static void turtle_escape(FILE *out, const char *s)
 {
+    if (s == NULL) return;
     for (; *s; s++) {
-        if (*s == '"') {
-            fputs("\\\"", out);
-        } else if (*s == '\\') {
-            fputs("\\\\", out);
-        } else if (*s == '\n') {
-            fputs("\\n", out);
-        } else if (*s == '\r') {
-            fputs("\\r", out);
-        } else {
-            fputc(*s, out);
-        }
+        if      (*s == '"')  fputs("\\\"", out);
+        else if (*s == '\\') fputs("\\\\", out);
+        else if (*s == '\n') fputs("\\n",  out);
+        else if (*s == '\r') fputs("\\r",  out);
+        else                 fputc(*s, out);
+    }
+}
+
+static void turtle_escape_n(FILE *out, const char *s, size_t n)
+{
+    if (s == NULL) return;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if      (ch == '"')  fputs("\\\"", out);
+        else if (ch == '\\') fputs("\\\\", out);
+        else if (ch == '\n') fputs("\\n",  out);
+        else if (ch == '\r') fputs("\\r",  out);
+        else                 fputc(ch, out);
     }
 }
 
@@ -42,51 +50,16 @@ static void emit_timestamp(FILE *out, int64_t ts_ms)
     fprintf(out, " ; carrier:at \"%s\"^^xsd:dateTime", buf);
 }
 
-/* Detect whether a message payload is a Carrier Turtle statement.
- * Looks for "[] a carrier:" near the start (after optional whitespace).
- */
-static int is_turtle(const char *text)
+/* Emit the leading `[] a carrier:<type> ; carrier:account "<id>"` common
+ * prefix. Caller appends event-specific predicates and the closing ` .\n`. */
+static void emit_header(FILE *out, const char *type, const char *account_id)
 {
-    const char *p = text;
-
-    while (*p && isspace((unsigned char)*p)) {
-        p++;
+    fprintf(out, "[] a carrier:%s", type);
+    if (account_id && account_id[0]) {
+        fprintf(out, " ; carrier:account \"");
+        turtle_escape(out, account_id);
+        fputc('"', out);
     }
-
-    return strncmp(p, "[] a carrier:", 13) == 0;
-}
-
-/* Emit a received Turtle statement, appending receiver metadata.
- * Types are unified — no rewriting needed. Just strip the trailing dot
- * and append the extra predicates.
- */
-static void emit_turtle_passthrough(FILE *out, const char *turtle,
-                                    uint32_t friend_id, const char *name,
-                                    int64_t ts_ms)
-{
-    /* Find trailing "." to strip it */
-    const char *last_dot = NULL;
-
-    for (const char *p = turtle; *p; p++) {
-        if (*p == '.') {
-            last_dot = p;
-        }
-    }
-
-    if (last_dot != NULL) {
-        fwrite(turtle, 1, (size_t)(last_dot - turtle), out);
-    } else {
-        fputs(turtle, out);
-    }
-
-    /* Append receiver metadata */
-    fprintf(out, " ; carrier:friendId %u ; carrier:name \"", friend_id);
-    turtle_escape(out, name);
-    fprintf(out, "\"");
-    emit_timestamp(out, ts_ms);
-
-    fprintf(out, " .\n");
-    fflush(out);
 }
 
 void turtle_emit_prefixes(FILE *out)
@@ -99,307 +72,124 @@ void turtle_emit_prefixes(FILE *out)
 void turtle_emit_event(const CarrierEvent *ev, void *userdata)
 {
     FILE *out = (FILE *)userdata;
-
-    if (out == NULL || ev == NULL) {
-        return;
-    }
+    if (out == NULL || ev == NULL) return;
 
     switch (ev->type) {
         case CARRIER_EVENT_CONNECTED:
-            fprintf(out, "[] a carrier:Connected ; carrier:transport \"%s\"",
-                    ev->connected.transport == 1 ? "TCP" : "UDP");
-            emit_timestamp(out, ev->timestamp);
+            emit_header(out, "Connected", ev->account_id);
             break;
 
         case CARRIER_EVENT_DISCONNECTED:
-            fprintf(out, "[] a carrier:Disconnected");
-            emit_timestamp(out, ev->timestamp);
+            emit_header(out, "Disconnected", ev->account_id);
+            break;
+
+        case CARRIER_EVENT_ACCOUNT_READY:
+            emit_header(out, "AccountReady", ev->account_id);
+            fprintf(out, " ; carrier:selfUri \"");
+            turtle_escape(out, ev->account_ready.self_uri);
+            fputc('"', out);
+            if (ev->account_ready.display_name[0]) {
+                fprintf(out, " ; carrier:displayName \"");
+                turtle_escape(out, ev->account_ready.display_name);
+                fputc('"', out);
+            }
+            break;
+
+        case CARRIER_EVENT_ACCOUNT_ERROR:
+            emit_header(out, "AccountError", ev->account_id);
+            fprintf(out, " ; carrier:cause \"");
+            if (ev->account_error.cause) turtle_escape(out, ev->account_error.cause);
+            fputc('"', out);
             break;
 
         case CARRIER_EVENT_SELF_ID:
-            fprintf(out, "[] a carrier:SelfId ; carrier:id \"%s\"", ev->self_id.id);
+            emit_header(out, "SelfId", ev->account_id);
+            fprintf(out, " ; carrier:selfUri \"");
+            turtle_escape(out, ev->self_id.self_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_TRUST_REQUEST:
+            emit_header(out, "TrustRequest", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->trust_request.from_uri);
+            fputc('"', out);
+            if (ev->trust_request.payload && ev->trust_request.payload_len > 0) {
+                fprintf(out, " ; carrier:payload \"");
+                turtle_escape_n(out, ev->trust_request.payload,
+                                ev->trust_request.payload_len);
+                fputc('"', out);
+            }
+            break;
+
+        case CARRIER_EVENT_CONTACT_ONLINE:
+            emit_header(out, "ContactOnline", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->contact_online.contact_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_CONTACT_OFFLINE:
+            emit_header(out, "ContactOffline", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->contact_offline.contact_uri);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_CONTACT_NAME:
+            emit_header(out, "ContactName", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->contact_name.contact_uri);
+            fprintf(out, "\" ; carrier:displayName \"");
+            turtle_escape(out, ev->contact_name.display_name);
+            fputc('"', out);
             break;
 
         case CARRIER_EVENT_TEXT_MESSAGE:
-            if (is_turtle(ev->text_message.text)) {
-                emit_turtle_passthrough(out, ev->text_message.text,
-                                        ev->text_message.friend_id,
-                                        ev->text_message.name,
-                                        ev->timestamp);
-                return;
+            emit_header(out, "TextMessage", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->text_message.contact_uri);
+            fprintf(out, "\" ; carrier:conversationId \"");
+            turtle_escape(out, ev->text_message.conversation_id);
+            fprintf(out, "\" ; carrier:messageId %llu ; carrier:text \"",
+                    (unsigned long long)ev->text_message.message_id);
+            if (ev->text_message.text) {
+                turtle_escape_n(out, ev->text_message.text, ev->text_message.text_len);
             }
-
-            fprintf(out, "[] a carrier:TextMessage ; carrier:friendId %u ; carrier:name \"",
-                    ev->text_message.friend_id);
-            turtle_escape(out, ev->text_message.name);
-            fprintf(out, "\" ; carrier:text \"");
-            turtle_escape(out, ev->text_message.text);
-            fprintf(out, "\"");
-            emit_timestamp(out, ev->timestamp);
+            fputc('"', out);
             break;
 
         case CARRIER_EVENT_MESSAGE_SENT:
-            fprintf(out, "[] a carrier:MessageSent ; carrier:friendId %u ; carrier:receipt %u",
-                    ev->message_sent.friend_id, ev->message_sent.receipt);
-            break;
-
-        case CARRIER_EVENT_FRIEND_REQUEST:
-            if (is_turtle(ev->friend_request.message)) {
-                /* Passthrough: strip trailing dot, append requestId + key */
-                const char *turtle = ev->friend_request.message;
-                const char *last_dot = NULL;
-
-                for (const char *p = turtle; *p; p++) {
-                    if (*p == '.') {
-                        last_dot = p;
-                    }
-                }
-
-                if (last_dot) {
-                    fwrite(turtle, 1, (size_t)(last_dot - turtle), out);
-                } else {
-                    fputs(turtle, out);
-                }
-
-                fprintf(out, " ; carrier:requestId %u ; carrier:key \"",
-                        ev->friend_request.request_id);
-                turtle_escape(out, ev->friend_request.key);
-                fprintf(out, "\" .\n");
-                fflush(out);
-                return;
-            }
-
-            fprintf(out, "[] a carrier:FriendRequest ; carrier:requestId %u ; carrier:key \"",
-                    ev->friend_request.request_id);
-            turtle_escape(out, ev->friend_request.key);
-            fprintf(out, "\" ; carrier:message \"");
-            turtle_escape(out, ev->friend_request.message);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_FRIEND_ONLINE:
-            fprintf(out, "[] a carrier:FriendOnline ; carrier:friendId %u ; carrier:name \"",
-                    ev->friend_online.friend_id);
-            turtle_escape(out, ev->friend_online.name);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_FRIEND_OFFLINE:
-            fprintf(out, "[] a carrier:FriendOffline ; carrier:friendId %u",
-                    ev->friend_offline.friend_id);
-            break;
-
-        case CARRIER_EVENT_NICK:
-            if (is_turtle(ev->nick.name)) {
-                /* Passthrough: append friendId */
-                const char *turtle = ev->nick.name;
-                const char *last_dot = NULL;
-
-                for (const char *p = turtle; *p; p++) {
-                    if (*p == '.') {
-                        last_dot = p;
-                    }
-                }
-
-                if (last_dot) {
-                    fwrite(turtle, 1, (size_t)(last_dot - turtle), out);
-                } else {
-                    fputs(turtle, out);
-                }
-
-                fprintf(out, " ; carrier:friendId %u .\n", ev->nick.friend_id);
-                fflush(out);
-                return;
-            }
-
-            fprintf(out, "[] a carrier:Nick ; carrier:friendId %u ; carrier:nick \"",
-                    ev->nick.friend_id);
-            turtle_escape(out, ev->nick.name);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_STATUS:
-            fprintf(out, "[] a carrier:Status ; carrier:friendId %u ; carrier:status %d",
-                    ev->status.friend_id, ev->status.status);
-            break;
-
-        case CARRIER_EVENT_STATUS_MESSAGE:
-            if (is_turtle(ev->status_message.text)) {
-                /* Passthrough: append friendId */
-                const char *turtle = ev->status_message.text;
-                const char *last_dot = NULL;
-
-                for (const char *p = turtle; *p; p++) {
-                    if (*p == '.') {
-                        last_dot = p;
-                    }
-                }
-
-                if (last_dot) {
-                    fwrite(turtle, 1, (size_t)(last_dot - turtle), out);
-                } else {
-                    fputs(turtle, out);
-                }
-
-                fprintf(out, " ; carrier:friendId %u .\n",
-                        ev->status_message.friend_id);
-                fflush(out);
-                return;
-            }
-
-            fprintf(out, "[] a carrier:StatusMessage ; carrier:friendId %u ; carrier:text \"",
-                    ev->status_message.friend_id);
-            turtle_escape(out, ev->status_message.text);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_GROUP_MESSAGE:
-            if (is_turtle(ev->group_message.text)) {
-                /* Passthrough: strip dot, append group metadata */
-                const char *turtle = ev->group_message.text;
-                const char *last_dot = NULL;
-
-                for (const char *p = turtle; *p; p++) {
-                    if (*p == '.') {
-                        last_dot = p;
-                    }
-                }
-
-                if (last_dot) {
-                    fwrite(turtle, 1, (size_t)(last_dot - turtle), out);
-                } else {
-                    fputs(turtle, out);
-                }
-
-                fprintf(out, " ; carrier:peerId %u ; carrier:name \"",
-                        ev->group_message.peer_id);
-                turtle_escape(out, ev->group_message.name);
-                fprintf(out, "\"");
-                emit_timestamp(out, ev->timestamp);
-                fprintf(out, " .\n");
-                fflush(out);
-                return;
-            }
-
-            fprintf(out, "[] a carrier:GroupMessage ; carrier:groupId %u ; carrier:peerId %u ; carrier:name \"",
-                    ev->group_message.group_id, ev->group_message.peer_id);
-            turtle_escape(out, ev->group_message.name);
-            fprintf(out, "\" ; carrier:text \"");
-            turtle_escape(out, ev->group_message.text);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_GROUP_PEER_JOIN:
-            fprintf(out, "[] a carrier:GroupPeerJoin ; carrier:groupId %u ; carrier:peerId %u ; carrier:name \"",
-                    ev->group_peer_join.group_id, ev->group_peer_join.peer_id);
-            turtle_escape(out, ev->group_peer_join.name);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_GROUP_PEER_EXIT:
-            fprintf(out, "[] a carrier:GroupPeerExit ; carrier:groupId %u ; carrier:peerId %u",
-                    ev->group_peer_exit.group_id, ev->group_peer_exit.peer_id);
-            break;
-
-        case CARRIER_EVENT_GROUP_INVITE:
-            fprintf(out, "[] a carrier:GroupInvite ; carrier:friendId %u ; carrier:name \"",
-                    ev->group_invite.friend_id);
-            turtle_escape(out, ev->group_invite.name);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_GROUP_SELF_JOIN:
-            fprintf(out, "[] a carrier:GroupSelfJoin ; carrier:groupId %u",
-                    ev->group_self_join.group_id);
-            break;
-
-        case CARRIER_EVENT_CONFERENCE_MESSAGE:
-        case CARRIER_EVENT_CONFERENCE_INVITE:
-            /* TODO */
-            return;
-
-        case CARRIER_EVENT_FILE_TRANSFER:
-            fprintf(out, "[] a carrier:FileTransfer ; carrier:friendId %u ; carrier:fileId %u ; carrier:size %lu ; carrier:filename \"",
-                    ev->file_transfer.friend_id, ev->file_transfer.file_id,
-                    (unsigned long)ev->file_transfer.file_size);
-            turtle_escape(out, ev->file_transfer.filename);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_FILE_SEND_STARTED:
-            fprintf(out, "[] a carrier:SendFileStarted ; carrier:friendId %u ; carrier:fileId %u ; carrier:size %lu ; carrier:filename \"",
-                    ev->file_send_started.friend_id, ev->file_send_started.file_id,
-                    (unsigned long)ev->file_send_started.file_size);
-            turtle_escape(out, ev->file_send_started.filename);
-            fprintf(out, "\"");
-            break;
-
-        case CARRIER_EVENT_FILE_PROGRESS:
-            fprintf(out, "[] a carrier:FileProgress ; carrier:friendId %u ; carrier:fileId %u ; carrier:progress %.4f ; carrier:bytesTransferred %lu ; carrier:direction \"%s\"",
-                    ev->file_progress.friend_id, ev->file_progress.file_id,
-                    ev->file_progress.progress,
-                    (unsigned long)ev->file_progress.bytes_transferred,
-                    ev->file_progress.outbound ? "out" : "in");
-            break;
-
-        case CARRIER_EVENT_FILE_COMPLETE:
-            fprintf(out, "[] a carrier:FileComplete ; carrier:friendId %u ; carrier:fileId %u ; carrier:direction \"%s\" ; carrier:cancelled %s",
-                    ev->file_complete.friend_id, ev->file_complete.file_id,
-                    ev->file_complete.outbound ? "out" : "in",
-                    ev->file_complete.cancelled ? "true" : "false");
-            break;
-
-        case CARRIER_EVENT_CALL:
-            fprintf(out, "[] a carrier:Call ; carrier:friendId %u ; carrier:audio %s ; carrier:video %s",
-                    ev->call.friend_id,
-                    ev->call.audio ? "true" : "false",
-                    ev->call.video ? "true" : "false");
-            break;
-
-        case CARRIER_EVENT_CALL_STATE:
-            fprintf(out, "[] a carrier:CallState ; carrier:friendId %u ; carrier:state %u",
-                    ev->call_state.friend_id, ev->call_state.state);
-            break;
-
-        case CARRIER_EVENT_PIPE:
-            fprintf(out, "[] a carrier:Pipe ; carrier:friendId %u",
-                    ev->pipe.friend_id);
-            break;
-
-        case CARRIER_EVENT_PIPE_DATA:
-            /* Binary data — not serialized to Turtle */
-            return;
-
-        case CARRIER_EVENT_PIPE_EOF:
-            fprintf(out, "[] a carrier:PipeEof ; carrier:friendId %u",
-                    ev->pipe_eof.friend_id);
-            break;
-
-        case CARRIER_EVENT_AUDIO_FRAME:
-        case CARRIER_EVENT_VIDEO_FRAME:
-            /* Binary data — not serialized to Turtle */
-            return;
-
-        case CARRIER_EVENT_DHT_INFO:
-            fprintf(out, "[] a carrier:DhtInfo ; carrier:key \"%s\" ; carrier:port %u",
-                    ev->dht_info.key, ev->dht_info.port);
+            emit_header(out, "MessageSent", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->message_sent.contact_uri);
+            fprintf(out, "\" ; carrier:conversationId \"");
+            turtle_escape(out, ev->message_sent.conversation_id);
+            fprintf(out, "\" ; carrier:messageId %llu ; carrier:status %d",
+                    (unsigned long long)ev->message_sent.message_id,
+                    ev->message_sent.status);
             break;
 
         case CARRIER_EVENT_ERROR:
-            fprintf(out, "[] a carrier:Error ; carrier:cmd \"");
-            turtle_escape(out, ev->error.cmd);
+            emit_header(out, "Error", ev->account_id);
+            fprintf(out, " ; carrier:command \"");
+            turtle_escape(out, ev->error.command);
+            fprintf(out, "\" ; carrier:class \"");
+            turtle_escape(out, ev->error.class_);
             fprintf(out, "\" ; carrier:message \"");
-            turtle_escape(out, ev->error.text);
-            fprintf(out, "\"");
+            if (ev->error.text) turtle_escape(out, ev->error.text);
+            fputc('"', out);
             break;
 
         case CARRIER_EVENT_SYSTEM:
-            fprintf(out, "[] a carrier:System ; carrier:message \"");
-            turtle_escape(out, ev->system.text);
-            fprintf(out, "\"");
+            emit_header(out, "System", ev->account_id);
+            fprintf(out, " ; carrier:message \"");
+            if (ev->system.text) turtle_escape(out, ev->system.text);
+            fputc('"', out);
             break;
     }
 
-    fprintf(out, " .\n");
+    emit_timestamp(out, ev->timestamp);
+    fputs(" .\n", out);
     fflush(out);
 }

@@ -1,7 +1,11 @@
 /*  turtle_parse.c
  *
  *  Turtle command parser for Carrier, powered by Serd.
- *  Parses full RDF 1.1 Turtle input and dispatches carrier_*() functions.
+ *  Parses RDF 1.1 Turtle input and dispatches carrier_*() calls.
+ *
+ *  M2 command surface: CreateAccount, LoadAccount, GetId, SetNick,
+ *  SendTrustRequest, AcceptTrustRequest, DiscardTrustRequest, RemoveContact,
+ *  SendMsg, Quit. See arch/jami-migration.md §4.
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.
@@ -40,29 +44,19 @@ struct parse_ctx {
     SerdEnv *env;
 };
 
-/* Extract the local name from a resolved URI.
- * E.g. "http://resonator.network/v2/carrier#SetNick" → "SetNick"
- */
+/* Extract the local name from a resolved URI. */
 static const char *local_name(const char *uri)
 {
     const char *hash = strrchr(uri, '#');
-
-    if (hash) {
-        return hash + 1;
-    }
+    if (hash) return hash + 1;
 
     const char *slash = strrchr(uri, '/');
-
-    if (slash) {
-        return slash + 1;
-    }
+    if (slash) return slash + 1;
 
     return uri;
 }
 
-/* Resolve a serd node to a full URI string using the environment.
- * Returns a malloc'd string that must be freed, or NULL.
- */
+/* Resolve a serd node to a full URI string. Caller must free. */
 static char *resolve_node(struct parse_ctx *ctx, const SerdNode *node)
 {
     if (node->type == SERD_URI) {
@@ -71,7 +65,6 @@ static char *resolve_node(struct parse_ctx *ctx, const SerdNode *node)
 
     if (node->type == SERD_CURIE) {
         SerdNode uri = serd_env_expand_node(ctx->env, node);
-
         if (uri.buf) {
             char *result = strndup((const char *)uri.buf, uri.n_bytes);
             serd_node_free(&uri);
@@ -105,37 +98,25 @@ static SerdStatus on_statement(void *handle,
                                const SerdNode *object_datatype,
                                const SerdNode *object_lang)
 {
-    (void)flags;
-    (void)graph;
-    (void)subject;
-    (void)object_datatype;
-    (void)object_lang;
+    (void)flags; (void)graph; (void)subject;
+    (void)object_datatype; (void)object_lang;
 
     struct parse_ctx *ctx = (struct parse_ctx *)handle;
     struct turtle_stmt *stmt = &ctx->stmt;
 
-    /* Resolve predicate URI */
     char *pred_uri = resolve_node(ctx, predicate);
+    if (pred_uri == NULL) return SERD_SUCCESS;
 
-    if (pred_uri == NULL) {
-        return SERD_SUCCESS;
-    }
-
-    /* Check if this is rdf:type (the "a" keyword) */
     if (strcmp(pred_uri, RDF_TYPE_URI) == 0) {
-        /* Object is the type — resolve it */
         char *type_uri = resolve_node(ctx, object);
-
         if (type_uri) {
             snprintf(stmt->type, sizeof(stmt->type), "%s", local_name(type_uri));
             free(type_uri);
         }
-
         free(pred_uri);
         return SERD_SUCCESS;
     }
 
-    /* Regular predicate — extract local name and object value */
     if (stmt->num_preds < MAX_PREDICATES) {
         struct turtle_predicate *p = &stmt->preds[stmt->num_preds];
         snprintf(p->name, sizeof(p->name), "%s", local_name(pred_uri));
@@ -144,9 +125,7 @@ static SerdStatus on_statement(void *handle,
             snprintf(p->value, sizeof(p->value), "%.*s",
                      (int)object->n_bytes, object->buf);
         } else {
-            /* URI or CURIE or blank node — resolve or use raw */
             char *obj_uri = resolve_node(ctx, object);
-
             if (obj_uri) {
                 snprintf(p->value, sizeof(p->value), "%s", local_name(obj_uri));
                 free(obj_uri);
@@ -155,7 +134,6 @@ static SerdStatus on_statement(void *handle,
                          (int)object->n_bytes, object->buf);
             }
         }
-
         stmt->num_preds++;
     }
 
@@ -164,8 +142,7 @@ static SerdStatus on_statement(void *handle,
 }
 
 /* ---------------------------------------------------------------------------
- * Dispatch: map parsed statement to carrier_*() calls
- * Same logic as before, just fed by serd instead of hand-rolled parser
+ * Dispatch
  * ---------------------------------------------------------------------------*/
 
 static const char *find_pred(const struct turtle_stmt *stmt, const char *name)
@@ -175,302 +152,199 @@ static const char *find_pred(const struct turtle_stmt *stmt, const char *name)
             return stmt->preds[i].value;
         }
     }
-
     return NULL;
 }
 
-static uint32_t find_pred_uint(const struct turtle_stmt *stmt, const char *name,
-                               uint32_t default_val)
+/* Every account-scoped command needs a `carrier:account`. Returns the value
+ * or emits an Error event and returns NULL. */
+static const char *require_account(Carrier *c, const struct turtle_stmt *stmt,
+                                   const char *command)
 {
-    const char *v = find_pred(stmt, name);
-
-    if (v == NULL) {
-        return default_val;
+    const char *account = find_pred(stmt, "account");
+    if (account == NULL || account[0] == '\0') {
+        carrier_emit_error(c, command, "MissingField",
+                           "command %s requires carrier:account", command);
+        return NULL;
     }
-
-    return (uint32_t)strtoul(v, NULL, 10);
+    return account;
 }
 
-static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt,
-                              const char *raw_turtle)
+static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
 {
     if (stmt->type[0] == '\0') {
-        return 0;  /* No type — probably a prefix declaration */
+        return 0;  /* Probably a prefix declaration */
     }
 
-    if (strcmp(stmt->type, "SelfId") == 0) {
-        return carrier_get_id(c);
-    }
+    /* --- Account lifecycle --- */
 
-    if (strcmp(stmt->type, "DhtInfo") == 0) {
-        return carrier_get_dht_info(c);
-    }
-
-    if (strcmp(stmt->type, "Bootstrap") == 0) {
-        const char *host = find_pred(stmt, "host");
-        uint32_t port = find_pred_uint(stmt, "port", 33445);
-        const char *key = find_pred(stmt, "key");
-
-        if (host == NULL || key == NULL) {
-            carrier_emit_error(c, "Bootstrap", "Missing carrier:host or carrier:key");
-            return -1;
+    if (strcmp(stmt->type, "CreateAccount") == 0) {
+        const char *name = find_pred(stmt, "displayName");
+        char new_id[CARRIER_ACCOUNT_ID_LEN];
+        if (carrier_create_account(c, name, new_id) != 0) {
+            carrier_emit_error(c, "CreateAccount", "LibjamiFailure",
+                               "carrier_create_account failed");
         }
-
-        return carrier_bootstrap(c, host, (uint16_t)port, key);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "Nick") == 0) {
+    if (strcmp(stmt->type, "LoadAccount") == 0) {
+        const char *account = require_account(c, stmt, "LoadAccount");
+        if (!account) return 0;
+        if (carrier_load_account(c, account) != 0) {
+            carrier_emit_error(c, "LoadAccount", "NoSuchAccount",
+                               "no account %s", account);
+        }
+        return 0;
+    }
+
+    /* --- Identity --- */
+
+    if (strcmp(stmt->type, "GetId") == 0) {
+        const char *account = require_account(c, stmt, "GetId");
+        if (!account) return 0;
+        carrier_get_id(c, account);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "SetNick") == 0) {
+        const char *account = require_account(c, stmt, "SetNick");
+        if (!account) return 0;
         const char *nick = find_pred(stmt, "nick");
-
-        if (nick == NULL) {
-            carrier_emit_error(c, "Nick", "Missing carrier:nick");
-            return -1;
-        }
-
-        return carrier_set_nick(c, nick);
+        if (!nick) nick = find_pred(stmt, "displayName");
+        carrier_set_nick(c, account, nick ? nick : "");
+        return 0;
     }
 
-    if (strcmp(stmt->type, "Status") == 0) {
-        const char *status = find_pred(stmt, "status");
+    /* --- Trust --- */
 
-        if (status == NULL) {
-            carrier_emit_error(c, "Status", "Missing carrier:status");
-            return -1;
+    if (strcmp(stmt->type, "SendTrustRequest") == 0) {
+        const char *account = require_account(c, stmt, "SendTrustRequest");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "SendTrustRequest", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
         }
-
-        int s = 0;
-
-        if (strcmp(status, "away") == 0) {
-            s = 1;
-        } else if (strcmp(status, "busy") == 0) {
-            s = 2;
-        }
-
-        return carrier_set_status(c, s);
-    }
-
-    if (strcmp(stmt->type, "StatusMessage") == 0) {
         const char *msg = find_pred(stmt, "message");
-
-        if (msg == NULL) {
-            msg = find_pred(stmt, "text");
-        }
-
-        if (msg == NULL) {
-            carrier_emit_error(c, "StatusMessage", "Missing carrier:message or carrier:text");
-            return -1;
-        }
-
-        return carrier_set_status_message(c, raw_turtle);
+        carrier_send_trust_request(c, account, uri, msg);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "FriendRequest") == 0) {
-        const char *id = find_pred(stmt, "id");
-
-        if (id == NULL) {
-            carrier_emit_error(c, "FriendRequest", "Missing carrier:id");
-            return -1;
+    if (strcmp(stmt->type, "AcceptTrustRequest") == 0) {
+        const char *account = require_account(c, stmt, "AcceptTrustRequest");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "AcceptTrustRequest", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
         }
-
-        return carrier_add_friend(c, id, raw_turtle);
+        carrier_accept_trust_request(c, account, uri);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "FriendAccept") == 0) {
-        uint32_t req_id = find_pred_uint(stmt, "requestId", UINT32_MAX);
-
-        if (req_id == UINT32_MAX) {
-            carrier_emit_error(c, "FriendAccept", "Missing carrier:requestId");
-            return -1;
+    if (strcmp(stmt->type, "DiscardTrustRequest") == 0) {
+        const char *account = require_account(c, stmt, "DiscardTrustRequest");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "DiscardTrustRequest", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
         }
-
-        return carrier_accept_friend(c, req_id);
+        carrier_discard_trust_request(c, account, uri);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "FriendDecline") == 0) {
-        uint32_t req_id = find_pred_uint(stmt, "requestId", UINT32_MAX);
-        return carrier_decline_friend(c, req_id);
+    if (strcmp(stmt->type, "RemoveContact") == 0) {
+        const char *account = require_account(c, stmt, "RemoveContact");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "RemoveContact", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
+        }
+        carrier_remove_contact(c, account, uri);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "TextMessage") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
+    /* --- Messaging --- */
+
+    if (strcmp(stmt->type, "SendMsg") == 0) {
+        const char *account = require_account(c, stmt, "SendMsg");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
         const char *text = find_pred(stmt, "text");
-
-        if (fid == UINT32_MAX || text == NULL) {
-            carrier_emit_error(c, "TextMessage", "Missing carrier:friendId or carrier:text");
-            return -1;
+        if (!uri || !text) {
+            carrier_emit_error(c, "SendMsg", "MissingField",
+                               "carrier:contactUri and carrier:text required");
+            return 0;
         }
-
-        return carrier_send_message(c, fid, raw_turtle);
+        carrier_send_message(c, account, uri, text);
+        return 0;
     }
 
-    if (strcmp(stmt->type, "GroupMessage") == 0) {
-        uint32_t gid = find_pred_uint(stmt, "groupId", UINT32_MAX);
-        const char *text = find_pred(stmt, "text");
-
-        if (gid == UINT32_MAX || text == NULL) {
-            carrier_emit_error(c, "GroupMessage", "Missing carrier:groupId or carrier:text");
-            return -1;
-        }
-
-        return carrier_send_group_message(c, gid, raw_turtle);
-    }
-
-    if (strcmp(stmt->type, "SendFile") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        const char *path = find_pred(stmt, "path");
-
-        if (fid == UINT32_MAX || path == NULL) {
-            carrier_emit_error(c, "SendFile", "Missing carrier:friendId or carrier:path");
-            return -1;
-        }
-
-        return carrier_send_file(c, fid, path);
-    }
-
-    if (strcmp(stmt->type, "AcceptFile") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        uint32_t file_id = find_pred_uint(stmt, "fileId", UINT32_MAX);
-        const char *path = find_pred(stmt, "path");
-
-        if (fid == UINT32_MAX || file_id == UINT32_MAX || path == NULL) {
-            carrier_emit_error(c, "AcceptFile",
-                               "Missing carrier:friendId/fileId/path");
-            return -1;
-        }
-
-        return carrier_accept_file(c, fid, file_id, path);
-    }
-
-    if (strcmp(stmt->type, "CancelFile") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        uint32_t file_id = find_pred_uint(stmt, "fileId", UINT32_MAX);
-
-        if (fid == UINT32_MAX || file_id == UINT32_MAX) {
-            carrier_emit_error(c, "CancelFile",
-                               "Missing carrier:friendId or carrier:fileId");
-            return -1;
-        }
-
-        return carrier_cancel_file(c, fid, file_id);
-    }
-
-    if (strcmp(stmt->type, "Group") == 0) {
-        const char *name = find_pred(stmt, "name");
-        const char *privacy = find_pred(stmt, "privacy");
-        bool is_public = (privacy != NULL && strcmp(privacy, "public") == 0);
-        return carrier_create_group(c, name ? name : "Group", is_public);
-    }
-
-    if (strcmp(stmt->type, "GroupLeave") == 0) {
-        uint32_t gid = find_pred_uint(stmt, "groupId", UINT32_MAX);
-        return carrier_leave_group(c, gid);
-    }
-
-    if (strcmp(stmt->type, "Call") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        const char *audio = find_pred(stmt, "audio");
-        const char *video = find_pred(stmt, "video");
-        return carrier_call(c, fid,
-                            audio == NULL || strcmp(audio, "true") == 0,
-                            video != NULL && strcmp(video, "true") == 0);
-    }
-
-    if (strcmp(stmt->type, "CallAnswer") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        const char *audio = find_pred(stmt, "audio");
-        const char *video = find_pred(stmt, "video");
-        return carrier_answer(c, fid,
-                              audio == NULL || strcmp(audio, "true") == 0,
-                              video != NULL && strcmp(video, "true") == 0);
-    }
-
-    if (strcmp(stmt->type, "CallHangup") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-        return carrier_hangup(c, fid);
-    }
-
-    if (strcmp(stmt->type, "Pipe") == 0) {
-        uint32_t fid = find_pred_uint(stmt, "friendId", UINT32_MAX);
-
-        if (fid == UINT32_MAX) {
-            carrier_emit_error(c, "Pipe", "Missing carrier:friendId");
-            return -1;
-        }
-
-        carrier_pipe_open(c, fid);
-        return 2;  /* Signal to enter pipe mode */
-    }
-
-    if (strcmp(stmt->type, "Save") == 0) {
-        return carrier_save(c);
-    }
+    /* --- Meta --- */
 
     if (strcmp(stmt->type, "Quit") == 0) {
-        return 1;  /* Signal to exit */
+        return 1;
     }
 
-    carrier_emit_error(c, "Parse", "Unknown command type: %s", stmt->type);
-    return -2;
+    carrier_emit_error(c, stmt->type, "UnknownCommand",
+                       "no such command in M2 vocabulary");
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
- * Public API
+ * Public entry point
  * ---------------------------------------------------------------------------*/
 
 int turtle_parse_and_execute(Carrier *c, const char *line)
 {
-    if (c == NULL || line == NULL) {
-        return -1;
-    }
-
-    /* Skip empty lines and comments */
-    const char *p = line;
-
-    while (*p && isspace((unsigned char)*p)) {
-        p++;
-    }
-
-    if (*p == '\0' || *p == '#') {
-        return 0;
-    }
+    if (c == NULL || line == NULL) return -1;
 
     struct parse_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.carrier = c;
-    ctx.result = 0;
-
-    /* Create serd environment for prefix resolution */
     ctx.env = serd_env_new(NULL);
 
-    /* Pre-register our carrier prefix */
-    SerdNode carrier_prefix = serd_node_from_string(SERD_LITERAL,
-        (const uint8_t *)"carrier");
-    SerdNode carrier_uri = serd_node_from_string(SERD_URI,
-        (const uint8_t *)CARRIER_NS);
-    serd_env_set_prefix(ctx.env, &carrier_prefix, &carrier_uri);
+    /* Pre-declare carrier:/xsd: so callers don't have to send @prefix lines
+     * before each command. Matches the prefixes emitted by turtle_emit. */
+    {
+        SerdNode carrier_name = serd_node_from_string(SERD_LITERAL,
+            (const uint8_t *)"carrier");
+        SerdNode carrier_uri  = serd_node_from_string(SERD_URI,
+            (const uint8_t *)CARRIER_NS);
+        serd_env_set_prefix(ctx.env, &carrier_name, &carrier_uri);
 
-    /* Also register xsd prefix */
-    SerdNode xsd_prefix = serd_node_from_string(SERD_LITERAL,
-        (const uint8_t *)"xsd");
-    SerdNode xsd_uri = serd_node_from_string(SERD_URI,
-        (const uint8_t *)"http://www.w3.org/2001/XMLSchema#");
-    serd_env_set_prefix(ctx.env, &xsd_prefix, &xsd_uri);
+        SerdNode xsd_name = serd_node_from_string(SERD_LITERAL,
+            (const uint8_t *)"xsd");
+        SerdNode xsd_uri  = serd_node_from_string(SERD_URI,
+            (const uint8_t *)"http://www.w3.org/2001/XMLSchema#");
+        serd_env_set_prefix(ctx.env, &xsd_name, &xsd_uri);
+    }
 
-    /* Create serd reader */
-    SerdReader *reader = serd_reader_new(
-        SERD_TURTLE, &ctx, NULL,
-        on_base, on_prefix, on_statement, NULL);
+    SerdReader *reader = serd_reader_new(SERD_TURTLE, &ctx, NULL,
+                                         on_base, on_prefix, on_statement, NULL);
+    if (reader == NULL) {
+        serd_env_free(ctx.env);
+        return -1;
+    }
 
-    /* Parse the input */
-    serd_reader_read_string(reader, (const uint8_t *)line);
+    SerdStatus st = serd_reader_read_string(reader, (const uint8_t *)line);
+    int ret = 0;
 
-    /* Dispatch accumulated statement */
-    if (ctx.stmt.type[0] != '\0') {
-        ctx.result = dispatch_statement(c, &ctx.stmt, line);
+    if (st == SERD_SUCCESS || st == SERD_FAILURE) {
+        ret = dispatch_statement(c, &ctx.stmt);
+    } else {
+        carrier_emit_error(c, "Parse", "InvalidTurtle",
+                           "serd error %d parsing input", (int)st);
+        ret = -1;
     }
 
     serd_reader_free(reader);
     serd_env_free(ctx.env);
-
-    return ctx.result;
+    return ret;
 }

@@ -12,7 +12,10 @@
 #define CARRIER_LOG_H
 
 #include "carrier.h"
-#include "carrier_internal.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Emit a log record to the registered callback.
  * Gated by level — records above c->log_level are discarded without formatting.
@@ -20,6 +23,10 @@
 void carrier_log(Carrier *c, CarrierLogLevel level, const char *tag,
                  const char *fmt, ...)
     __attribute__((format(printf, 4, 5)));
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 /* Convenience macros. Argument order mirrors carrier_log. */
 #define CLOG_ERROR(c, tag, ...) carrier_log((c), CARRIER_LOG_ERROR, (tag), __VA_ARGS__)

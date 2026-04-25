@@ -4,3 +4,6 @@
 [submodule "third_party/toxcore"]
 	path = third_party/toxcore
 	url = https://github.com/TokTok/c-toxcore.git
+[submodule "third_party/jami-daemon"]
+	path = third_party/jami-daemon
+	url = https://github.com/savoirfairelinux/jami-daemon.git
