@@ -128,12 +128,27 @@ rm -rf "$SRC_DIR/build"
   cmake --build build -j"$NPROC"
 )
 
-# 4. Stage artifacts into the prefix
+# 4. Stage artifacts into the prefix.
+#
+# pjproject and a couple of its siblings (srtp, yuv) name their static
+# archives with the full BUILD_TRIPLE — including the macOS kernel
+# version (e.g. libpj-aarch64-apple-darwin23.6.0.a). That makes a tarball
+# built on one kernel useless to consumers running another kernel, even
+# though the ABI is stable for our SDK target. Strip the kernel version
+# at staging time so the artefact name matches ARTIFACT_TRIPLE and the
+# same prefix serves every macOS host. Linux's BUILD_TRIPLE has no
+# kernel version, so this rewrite is a no-op there.
 echo "==> Staging to $PREFIX"
 rm -rf "$PREFIX"
 mkdir -p "$PREFIX/lib" "$PREFIX/include/jami"
 cp "$SRC_DIR/build/libjami-core.a" "$PREFIX/lib/"
-cp "$SRC_DIR/contrib/$BUILD_TRIPLE/lib/"*.a "$PREFIX/lib/"
+for src in "$SRC_DIR/contrib/$BUILD_TRIPLE/lib/"*.a; do
+  base="$(basename "$src")"
+  # Replace -<arch>-apple-darwinN.N.N (or -<arch>-linux-gnu) with the
+  # kernel-stripped triple. sed -E is portable across BSD and GNU.
+  dst="$(echo "$base" | sed -E "s/-($(uname -m)|aarch64|x86_64)-apple-darwin[0-9.]+\.a$/-\1-apple-darwin.a/")"
+  cp "$src" "$PREFIX/lib/$dst"
+done
 cp "$SRC_DIR/src/jami/"*.h "$PREFIX/include/jami/"
 
 cat > "$PREFIX/MANIFEST" <<EOF

@@ -37,12 +37,14 @@ JAMI_CONTRIB_LIB  = $(JAMI_PREFIX)/lib
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
-UNAME_R := $(shell uname -r)
 
 # pjsip names its libraries with the GNU arch convention (aarch64) while the
-# host triple uses the Apple arch name (arm64). Only the lib filenames care.
+# host triple uses the Apple arch name (arm64). The lib filenames also drop
+# the macOS kernel version — see tools/build-libjami.sh's staging step,
+# which rewrites kernel-versioned names into a stable suffix so the same
+# prefix serves every macOS host.
 ifeq ($(UNAME_S), Darwin)
-JAMI_PJ_TRIPLE   = $(subst arm64,aarch64,$(UNAME_M))-apple-darwin$(UNAME_R)
+JAMI_PJ_TRIPLE   = $(subst arm64,aarch64,$(UNAME_M))-apple-darwin
 else ifeq ($(UNAME_S), Linux)
 JAMI_PJ_TRIPLE   = $(UNAME_M)-linux-gnu
 endif

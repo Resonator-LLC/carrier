@@ -81,7 +81,7 @@ jobs:
             autoconf automake libtool nasm yasm ninja-build cmake pkg-config \
             build-essential git curl python3 \
             libpipewire-0.3-dev libpulse-dev libasound2-dev libv4l-dev \
-            libudev-dev
+            libudev-dev libva-dev libvdpau-dev
 
       # We don't cache the full libjami-src tree: when a build fails partway,
       # actions/cache's post-step still saves the partial state, and the next
