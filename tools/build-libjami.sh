@@ -27,6 +27,9 @@ SHA="$(tr -d '[:space:]' < "$PIN_FILE")"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/resonator"
 SRC_DIR="$CACHE_ROOT/libjami-src/$SHA"
 PREFIX="$CACHE_ROOT/libjami/$SHA"
+# Tarball cache shared across SHA bumps. Upstream tarballs are content-addressed
+# so a gnutls-3.8.9.tar.xz fetched at one SHA is reusable at the next.
+TARBALL_CACHE="$CACHE_ROOT/libjami-tarballs"
 
 # Two distinct triples:
 #   BUILD_TRIPLE  - matches contrib's output dir; includes uname -r on macOS
@@ -81,14 +84,15 @@ git -C "$SRC_DIR" submodule update --init --recursive
 # that miss Apple Silicon's /opt/homebrew/include — which is the issue
 # the now-deleted 0001-macos-pjproject-gnutls-prefix.patch worked around.
 #
-# We sidestep it by clearing PKG_CONFIG_LIBDIR for the contrib phase so
-# every dep is source-built. Hermetic, slower first time, no patch.
+# --ignore-system-libs forces every dep to be source-built. Hermetic,
+# slower first time, no patch. Tarballs are cached across SHAs via
+# --cache-dir so SHA bumps don't re-download identical archives.
 echo "==> Building contrib (hermetic; may take 30-90 min)"
-mkdir -p "$SRC_DIR/contrib/native"
+mkdir -p "$SRC_DIR/contrib/native" "$TARBALL_CACHE"
 (
   cd "$SRC_DIR/contrib/native"
-  PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" ../bootstrap
-  PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" make -j"$NPROC"
+  ../bootstrap --ignore-system-libs --cache-dir="$TARBALL_CACHE"
+  make -j"$NPROC"
 )
 
 # 3. Build the daemon (cmake)

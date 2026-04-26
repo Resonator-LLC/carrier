@@ -15,14 +15,17 @@ PREFIX ?= /usr/local
 #   $(JAMI_PREFIX)/lib/lib<contrib>.a   — contrib deps (~39 archives)
 #   $(JAMI_PREFIX)/include/jami/*.h     — public headers
 #
-# Populate the prefix one of two ways:
-#   make libjami-build    — clone jami-daemon at the pinned SHA outside the
-#                           repo, build hermetically, stage into the cache
-#                           (cold build: 1-3 hours)
-#   make libjami-fetch    — download a pre-built tarball (future; not yet
-#                           hosted)
+# Populate the prefix one of three ways:
+#   make libjami         — fetch pre-built tarball; fall back to source build
+#                          (recommended; ~30s when an artifact is published)
+#   make libjami-fetch   — download a pre-built tarball only (no fallback)
+#   make libjami-build   — clone jami-daemon at the pinned SHA outside the
+#                          repo, build hermetically, stage into the cache
+#                          (cold build: 1-3 hours)
 #
-# See arch/jami-migration.md D21 for the rationale (replaces D18 + D19).
+# Pre-built tarballs are produced by .github/workflows/build-libjami-artifacts.yml
+# whenever JAMI_VERSION changes on main; see arch/jami-migration.md D21 for the
+# overall design rationale.
 # ---------------------------------------------------------------------------
 
 JAMI_SHA          := $(shell tr -d '[:space:]' < JAMI_VERSION 2>/dev/null)
@@ -171,7 +174,7 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build libjami-fetch
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami libjami-build libjami-fetch
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
@@ -184,11 +187,19 @@ check-libjami:
 	    echo "ERROR: libjami not found at $(JAMI_LIB)"; \
 	    echo ""; \
 	    echo "Populate the prefix with one of:"; \
-	    echo "  make libjami-build    # cold build, 1-3 hours, hermetic"; \
-	    echo "  make libjami-fetch    # download pre-built tarball (not yet hosted)"; \
+	    echo "  make libjami          # fetch pre-built; fall back to source build"; \
+	    echo "  make libjami-fetch    # fetch only (fail if not published)"; \
+	    echo "  make libjami-build    # source build, 1-3 hours, hermetic"; \
 	    echo ""; \
 	    echo "Or set JAMI_PREFIX to point at an existing libjami install."; \
 	    exit 1; \
+	fi
+
+libjami:
+	@if ! tools/fetch-libjami.sh; then \
+	    echo ""; \
+	    echo "==> Fetch failed; falling back to source build."; \
+	    tools/build-libjami.sh; \
 	fi
 
 libjami-build:
@@ -197,7 +208,7 @@ libjami-build:
 libjami-fetch:
 	@tools/fetch-libjami.sh
 
-deps: libjami-build
+deps: libjami
 
 # --- Static library ---
 $(BUILD_DIR)/libcarrier.a: $(LIB_CXX_OBJ) $(SERD_OBJ)

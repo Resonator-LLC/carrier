@@ -1,10 +1,13 @@
 name: Build libjami artifacts
 
-# Manually triggered. Builds libjami at the SHA pinned in JAMI_VERSION on
-# every supported triple, tars the resulting cache prefix, and uploads each
-# tarball as an asset on a release tagged `libjami-<sha>`. Once published,
-# `make libjami-fetch` (TODO) downloads + verifies these tarballs instead
-# of building from source on every dev machine.
+# Builds libjami at the SHA pinned in JAMI_VERSION on every supported triple,
+# tars the resulting cache prefix, and uploads each tarball as an asset on a
+# release tagged `libjami-<sha>`. Once published, `make libjami` (and
+# `make libjami-fetch`) downloads + verifies these tarballs instead of
+# building from source on every dev machine.
+#
+# Triggered automatically when a commit on main changes JAMI_VERSION, and
+# manually via workflow_dispatch (e.g. for re-runs or tag overrides).
 #
 # Cold builds take 1-3 hours per runner. Re-running with the same SHA is
 # a no-op via the build script's idempotency.
@@ -16,6 +19,14 @@ on:
         description: "Release tag (default: libjami-<sha>)"
         required: false
         default: ""
+  # Auto-publish when the pinned SHA changes on main. JAMI_VERSION is the
+  # single source of truth for which libjami the project consumes, so any
+  # commit that bumps it should produce a fresh artefact set.
+  push:
+    branches:
+      - main
+    paths:
+      - JAMI_VERSION
 
 permissions:
   contents: write  # required for softprops/action-gh-release
@@ -77,11 +88,17 @@ jobs:
       # run inherits a poisoned tree (e.g. ffmpeg's configure runs before opus
       # was rebuilt). Only the upstream tarballs are cached, since they're
       # content-addressed and can't be poisoned.
+      #
+      # The path matches build-libjami.sh's --cache-dir: a SHA-independent
+      # location so SHA bumps reuse already-downloaded archives. Cache key
+      # restores from any earlier run on the same OS.
       - name: Cache contrib tarballs
         uses: actions/cache@v4
         with:
-          path: ~/.cache/resonator/libjami-src/${{ needs.prepare.outputs.sha }}/contrib/native/tarballs
-          key: libjami-tarballs-${{ needs.prepare.outputs.sha }}-${{ runner.os }}
+          path: ~/.cache/resonator/libjami-tarballs
+          key: libjami-tarballs-${{ runner.os }}-${{ needs.prepare.outputs.sha }}
+          restore-keys: |
+            libjami-tarballs-${{ runner.os }}-
 
       - name: Build libjami
         run: |
@@ -116,7 +133,7 @@ jobs:
           name: ${{ needs.prepare.outputs.tag }}
           body: |
             libjami pre-built static prefix for SHA `${{ needs.prepare.outputs.sha }}`.
-            Consumed by `make libjami-fetch` (see arch/jami-migration.md D21).
+            Consumed by `make libjami` / `make libjami-fetch` (see arch/jami-migration.md D21).
           files: |
             ${{ runner.temp }}/${{ steps.artifact.outputs.name }}
             ${{ runner.temp }}/${{ steps.artifact.outputs.name }}.sha256
