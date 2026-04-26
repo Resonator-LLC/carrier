@@ -13,16 +13,18 @@
  *  and src/carrier_jami_signals.cc. See arch/jami-migration.md for the full
  *  migration plan; decisions D1–D20 are the load-bearing context.
  *
- *  Scope as of M4a (this header): lifecycle, account creation/loading,
+ *  Scope as of M5α (this header): lifecycle, account creation/loading,
  *  self-ID, trust requests, 1:1 text messaging, multi-party Swarm
  *  conversations (create, send, accept/decline invitation, invite member,
  *  remove), reactions, continuous presence, Swarm file transfers
  *  (offer/accept/cancel via DataTransferSignal::DataTransferEvent and
  *  inbound `application/data-transfer+json` commits), and device linking
  *  (new-device account-creation in linking mode, source-device authorize,
- *  revoke). Calls (audio/video) deferred to M4b. Functions and event types
- *  are added as they land — there are no forward-declared placeholders for
- *  unimplemented surface.
+ *  revoke). Calls (audio/video) are out of scope at v0.2.x — the
+ *  forward-looking call vocabulary inherited from v0.1 was retired in
+ *  v0.2.6 and will be reintroduced in v0.3 if a consumer demands it.
+ *  Functions and event types are added as they land — there are no
+ *  forward-declared placeholders for unimplemented surface.
  *
  *  v3.2 break (M4a): `message_id` is now a 40-hex Swarm commit hash
  *  (`char[CARRIER_MESSAGE_ID_LEN]`) on every event that carries one,
@@ -50,7 +52,7 @@
 #define CARRIER_VERSION_MAJOR 3
 #define CARRIER_VERSION_MINOR 2
 #define CARRIER_VERSION_PATCH 0
-#define CARRIER_VERSION_STRING "3.2.0-dev"
+#define CARRIER_VERSION_STRING "3.2.0"
 
 #include <stdbool.h>
 #include <stddef.h>
