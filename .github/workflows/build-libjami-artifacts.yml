@@ -72,17 +72,16 @@ jobs:
             libpipewire-0.3-dev libpulse-dev libasound2-dev libv4l-dev \
             libudev-dev
 
-      - name: Cache libjami source clone
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/resonator/libjami-src/${{ needs.prepare.outputs.sha }}
-          key: libjami-src-${{ needs.prepare.outputs.sha }}
-
+      # We don't cache the full libjami-src tree: when a build fails partway,
+      # actions/cache's post-step still saves the partial state, and the next
+      # run inherits a poisoned tree (e.g. ffmpeg's configure runs before opus
+      # was rebuilt). Only the upstream tarballs are cached, since they're
+      # content-addressed and can't be poisoned.
       - name: Cache contrib tarballs
         uses: actions/cache@v4
         with:
           path: ~/.cache/resonator/libjami-src/${{ needs.prepare.outputs.sha }}/contrib/native/tarballs
-          key: libjami-tarballs-${{ needs.prepare.outputs.sha }}
+          key: libjami-tarballs-${{ needs.prepare.outputs.sha }}-${{ runner.os }}
 
       - name: Build libjami
         run: |
