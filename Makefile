@@ -135,6 +135,13 @@ JAMI_CONTRIB_LIBS = \
     $(JAMI_CONTRIB_LIB)/libtls.a \
     $(JAMI_CONTRIB_LIB)/libz.a
 
+# libiconv + libcharset are produced by contrib only when --ignore-system-libs
+# is passed to bootstrap (which wipes iconv's unconditional PKGS_FOUND on
+# POSIX; see tools/build-libjami.sh). When present, libavformat references
+# GNU's `_libiconv_*` symbols and resolves them here. When absent, libavformat
+# uses system `_iconv_*` resolved via Darwin's -liconv / glibc.
+JAMI_CONTRIB_LIBS += $(wildcard $(JAMI_CONTRIB_LIB)/libiconv.a $(JAMI_CONTRIB_LIB)/libcharset.a)
+
 LDFLAGS += $(JAMI_CONTRIB_LIBS)
 
 # All third-party C/C++ deps come from contrib (hermetic build, see D21).

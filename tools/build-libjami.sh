@@ -78,17 +78,29 @@ git -C "$SRC_DIR" fetch origin "$SHA" 2>/dev/null || true
 git -C "$SRC_DIR" checkout --quiet "$SHA"
 git -C "$SRC_DIR" submodule update --init --recursive
 
-# 2. Build contrib deps. We follow the daemon's official build path
-# (README "Compile the dependencies"): bootstrap from contrib/native,
-# then make. No flags — the official Dockerfile doesn't pass any to
-# bootstrap either. With the full apt list installed on Linux (see
-# build-libjami-artifacts.yml, which mirrors the daemon's top-level
-# Dockerfile) contrib's dpkg detection adds the right packages to
-# PKGS_FOUND. On macOS, the README brew list installs *tools only*
-# (no libraries), so contrib auto-detects nothing system-wide and
-# source-builds every dep — except `iconv`, which is unconditionally
-# PKGS_FOUND on POSIX (rules.mak:10-11) and links against macOS's
-# system libiconv (the `_iconv_open` symbol family).
+# 2. Build contrib deps with --ignore-system-libs.
+#
+# We diverge from the daemon's official `cmake .. && make` path here.
+# The official path lets contrib's pkg-config / dpkg auto-detection
+# substitute system libraries for parts of its dep tree, which is
+# correct for an end-user daemon install — the daemon links against
+# whatever libssl/libgnutls/etc. the OS package manager provides.
+#
+# We're producing a *static prefix* that downstream consumers (carrier)
+# link against by file path. Anything that auto-detection skips is
+# absent from $PREFIX/lib and breaks the consumer's link list. On
+# the macos-14 runner image, brew pre-installs openssl/gnutls/zlib;
+# on Ubuntu, apt-installed libgnutls28-dev/libssl-dev are visible
+# to dpkg-query. Both routes leave libcrypto.a/libssl.a/libgnutls.a
+# out of our staged prefix.
+#
+# --ignore-system-libs forces every contrib package source-built
+# regardless of system detection. PKGS_FOUND is wiped at config
+# time (contrib/src/main.mak), so iconv (unconditionally added to
+# PKGS_FOUND on POSIX) ends up source-built too — and the resulting
+# libavformat references GNU's `_libiconv_*` symbols. Carrier's
+# Makefile already wildcards libiconv.a / libcharset.a out of the
+# prefix to keep the link clean.
 #
 # Tarballs are pooled across SHA bumps via a symlink: the contrib
 # default location (contrib/tarballs) points at $TARBALL_CACHE so
@@ -110,7 +122,7 @@ fi
 ln -sfn "$TARBALL_CACHE" "$SRC_DIR/contrib/tarballs"
 (
   cd "$SRC_DIR/contrib/native"
-  ../bootstrap
+  ../bootstrap --ignore-system-libs
   make -j"$NPROC"
 )
 
