@@ -5,42 +5,44 @@ AR  ?= ar
 PREFIX ?= /usr/local
 
 # ---------------------------------------------------------------------------
-# Dependencies
+# libjami prefix
 #
-# This Makefile assumes libjami (from the vendored submodule) has already
-# been built. The expected layout after a successful
-# `cmake --build third_party/jami-daemon/build` is:
+# libjami is consumed as a pre-built static prefix at $(JAMI_PREFIX), which
+# defaults to ${XDG_CACHE_HOME:-$HOME/.cache}/resonator/libjami/<sha>/ where
+# <sha> is the line read from JAMI_VERSION. The prefix is laid out as:
 #
-#   third_party/jami-daemon/build/src/libjami.a         — the library
-#   third_party/jami-daemon/contrib/<host>/lib/*.a     — contrib deps
-#   third_party/jami-daemon/src/jami/*.h               — public headers
+#   $(JAMI_PREFIX)/lib/libjami-core.a   — the core library
+#   $(JAMI_PREFIX)/lib/lib<contrib>.a   — contrib deps (~39 archives)
+#   $(JAMI_PREFIX)/include/jami/*.h     — public headers
 #
-# See arch/jami-migration.md D18–D20 for why we vendor + build in place on
-# macOS instead of using a system package. Linux may grow a system-package
-# path here later (D17).
+# Populate the prefix one of two ways:
+#   make libjami-build    — clone jami-daemon at the pinned SHA outside the
+#                           repo, build hermetically, stage into the cache
+#                           (cold build: 1-3 hours)
+#   make libjami-fetch    — download a pre-built tarball (future; not yet
+#                           hosted)
+#
+# See arch/jami-migration.md D21 for the rationale (replaces D18 + D19).
 # ---------------------------------------------------------------------------
 
-JAMI_DIR           = third_party/jami-daemon
-JAMI_INC           = $(JAMI_DIR)/src
-JAMI_BUILD         = $(JAMI_DIR)/build
-JAMI_LIB           = $(JAMI_BUILD)/libjami-core.a
+JAMI_SHA          := $(shell tr -d '[:space:]' < JAMI_VERSION 2>/dev/null)
+XDG_CACHE_HOME    ?= $(HOME)/.cache
+JAMI_PREFIX       ?= $(XDG_CACHE_HOME)/resonator/libjami/$(JAMI_SHA)
+JAMI_INC          = $(JAMI_PREFIX)/include
+JAMI_LIB          = $(JAMI_PREFIX)/lib/libjami-core.a
+JAMI_CONTRIB_LIB  = $(JAMI_PREFIX)/lib
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 UNAME_R := $(shell uname -r)
 
-ifeq ($(UNAME_S), Darwin)
-JAMI_HOST_TRIPLE = $(UNAME_M)-apple-darwin$(UNAME_R)
 # pjsip names its libraries with the GNU arch convention (aarch64) while the
-# Apple contrib dir uses arm64. Everything else in contrib uses the Apple name.
+# host triple uses the Apple arch name (arm64). Only the lib filenames care.
+ifeq ($(UNAME_S), Darwin)
 JAMI_PJ_TRIPLE   = $(subst arm64,aarch64,$(UNAME_M))-apple-darwin$(UNAME_R)
 else ifeq ($(UNAME_S), Linux)
-JAMI_HOST_TRIPLE = $(UNAME_M)-linux-gnu
-JAMI_PJ_TRIPLE   = $(JAMI_HOST_TRIPLE)
+JAMI_PJ_TRIPLE   = $(UNAME_M)-linux-gnu
 endif
-
-JAMI_CONTRIB_LIB   = $(JAMI_DIR)/contrib/$(JAMI_HOST_TRIPLE)/lib
-JAMI_CONTRIB_INC   = $(JAMI_DIR)/contrib/$(JAMI_HOST_TRIPLE)/include
 
 # --- Serd (compiled from submodule sources; still C) ---
 SERD_DIR     = third_party/serd
@@ -157,38 +159,31 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build apply-jami-patches
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami-build libjami-fetch
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
 check-libjami:
+	@if [ -z "$(JAMI_SHA)" ]; then \
+	    echo "ERROR: JAMI_VERSION is missing or empty (expected at $(CURDIR)/JAMI_VERSION)"; \
+	    exit 1; \
+	fi
 	@if [ ! -f "$(JAMI_LIB)" ]; then \
-	    echo "ERROR: $(JAMI_LIB) not found."; \
-	    echo "Build libjami first: make libjami-build"; \
-	    echo "(or: cd $(JAMI_DIR) && cmake -S . -B build && cmake --build build -j$(NPROC))"; \
+	    echo "ERROR: libjami not found at $(JAMI_LIB)"; \
+	    echo ""; \
+	    echo "Populate the prefix with one of:"; \
+	    echo "  make libjami-build    # cold build, 1-3 hours, hermetic"; \
+	    echo "  make libjami-fetch    # download pre-built tarball (not yet hosted)"; \
+	    echo ""; \
+	    echo "Or set JAMI_PREFIX to point at an existing libjami install."; \
 	    exit 1; \
 	fi
 
-# Apply local patches to the jami-daemon submodule. Idempotent: each patch is
-# applied only if `git apply --reverse --check` says it isn't already in place.
-# Patches live in patches/jami-daemon/*.patch and document deviations from the
-# pinned upstream commit (D19). Each one should have a header explaining why
-# the change exists and a note about whether an upstream PR is open.
-apply-jami-patches:
-	@for p in patches/jami-daemon/*.patch; do \
-	    [ -f "$$p" ] || continue; \
-	    if git -C $(JAMI_DIR) apply --reverse --check "$(CURDIR)/$$p" 2>/dev/null; then \
-	        echo "  PATCH skip $$p (already applied)"; \
-	    else \
-	        echo "  PATCH      $$p"; \
-	        git -C $(JAMI_DIR) apply "$(CURDIR)/$$p"; \
-	    fi; \
-	done
+libjami-build:
+	@tools/build-libjami.sh
 
-libjami-build: apply-jami-patches
-	@echo "  CMAKE libjami (this may take 1-3 hours cold)..."
-	cd $(JAMI_DIR) && cmake -S . -B build -DBUILD_SHARED_LIBS=OFF
-	cmake --build $(JAMI_DIR)/build -j$(NPROC)
+libjami-fetch:
+	@tools/fetch-libjami.sh
 
 deps: libjami-build
 
@@ -260,4 +255,4 @@ clean:
 	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
 distclean: clean
-	rm -rf $(JAMI_BUILD)
+	@echo "distclean: not removing $(JAMI_PREFIX) — run 'rm -rf $(XDG_CACHE_HOME)/resonator' to wipe the libjami cache"

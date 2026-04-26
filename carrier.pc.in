@@ -4,8 +4,11 @@ libdir=${prefix}/lib
 includedir=${prefix}/include
 
 Name: carrier
-Description: Cross-platform C library for the Tox protocol
+Description: Cross-platform C library for the Jami protocol (RDF Turtle wire format)
 Version: @VERSION@
 Cflags: -I${includedir}
 Libs: -L${libdir} -lcarrier
-Libs.private: -ltoxcore -lsodium -lopus -lvpx -lpthread
+# Libs.private: libjami + ~39 contrib archives + system deps. The full closure
+# is encoded in carrier/Makefile (LDFLAGS) and antenna/build.rs; downstream
+# consumers should drive their link from those, not this .pc.
+Libs.private:

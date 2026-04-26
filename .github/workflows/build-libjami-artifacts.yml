@@ -1,0 +1,121 @@
+name: Build libjami artifacts
+
+# Manually triggered. Builds libjami at the SHA pinned in JAMI_VERSION on
+# every supported triple, tars the resulting cache prefix, and uploads each
+# tarball as an asset on a release tagged `libjami-<sha>`. Once published,
+# `make libjami-fetch` (TODO) downloads + verifies these tarballs instead
+# of building from source on every dev machine.
+#
+# Cold builds take 1-3 hours per runner. Re-running with the same SHA is
+# a no-op via the build script's idempotency.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Release tag (default: libjami-<sha>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # required for softprops/action-gh-release
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.read-pin.outputs.sha }}
+      tag: ${{ steps.read-pin.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read JAMI_VERSION
+        id: read-pin
+        run: |
+          sha=$(tr -d '[:space:]' < JAMI_VERSION)
+          test -n "$sha" || { echo "JAMI_VERSION is empty" >&2; exit 1; }
+          tag="${{ inputs.release-tag }}"
+          [ -z "$tag" ] && tag="libjami-$sha"
+          echo "sha=$sha"  >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"  >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    timeout-minutes: 240  # cold contrib + daemon build can run 2-3h
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14         # arm64
+            triple-prefix: arm64-apple-darwin
+          - runner: macos-13         # x86_64
+            triple-prefix: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            triple-prefix: x86_64-linux-gnu
+          - runner: ubuntu-24.04
+            triple-prefix: x86_64-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install automake libtool nasm yasm ninja cmake pkg-config
+
+      - name: Install host build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool nasm yasm ninja-build cmake pkg-config \
+            build-essential git curl python3
+
+      - name: Cache libjami source clone
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/resonator/libjami-src/${{ needs.prepare.outputs.sha }}
+          key: libjami-src-${{ needs.prepare.outputs.sha }}
+
+      - name: Cache contrib tarballs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/resonator/libjami-src/${{ needs.prepare.outputs.sha }}/contrib/native/tarballs
+          key: libjami-tarballs-${{ needs.prepare.outputs.sha }}
+
+      - name: Build libjami
+        run: |
+          ./tools/build-libjami.sh
+
+      - name: Determine artifact name
+        id: artifact
+        run: |
+          PREFIX=$(./tools/build-libjami.sh --print-prefix)
+          # Resolve the actual host triple from MANIFEST so artefact names
+          # match what consumers will expect (uname -r drift on macOS etc.)
+          TRIPLE=$(awk -F= '/^host_triple=/{print $2}' "$PREFIX/MANIFEST")
+          NAME="libjami-${{ needs.prepare.outputs.sha }}-${TRIPLE}.tar.zst"
+          echo "prefix=$PREFIX"  >> "$GITHUB_OUTPUT"
+          echo "triple=$TRIPLE"  >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"      >> "$GITHUB_OUTPUT"
+
+      - name: Pack tarball
+        run: |
+          cd "$(dirname '${{ steps.artifact.outputs.prefix }}')"
+          tar --use-compress-program='zstd -19 -T0' \
+              -cf "$RUNNER_TEMP/${{ steps.artifact.outputs.name }}" \
+              "$(basename '${{ steps.artifact.outputs.prefix }}')"
+          (cd "$RUNNER_TEMP" && shasum -a 256 "${{ steps.artifact.outputs.name }}" \
+              > "${{ steps.artifact.outputs.name }}.sha256")
+          ls -la "$RUNNER_TEMP/${{ steps.artifact.outputs.name }}"*
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body: |
+            libjami pre-built static prefix for SHA `${{ needs.prepare.outputs.sha }}`.
+            Consumed by `make libjami-fetch` (see arch/jami-migration.md D21).
+          files: |
+            ${{ runner.temp }}/${{ steps.artifact.outputs.name }}
+            ${{ runner.temp }}/${{ steps.artifact.outputs.name }}.sha256
