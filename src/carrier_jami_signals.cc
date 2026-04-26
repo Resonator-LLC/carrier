@@ -299,12 +299,28 @@ void on_swarm_message_received(Carrier *c,
     const std::string from = get("author");
     std::string body       = get("body");
 
-    /* Skip our own messages echoed back via Swarm sync. */
+    /* Own messages echoed back via Swarm sync are how the sender learns the
+     * commit's messageId — libjami's accountMessageStatusChanged signal does
+     * not fire on Swarm 1:1 sends. Surface the id as a MessageSent event and
+     * skip the TextMessage path so consumers don't see their own messages
+     * twice. status=0 here is the "committed locally" snapshot; libjami may
+     * still emit later transitions via accountMessageStatusChanged for legacy
+     * routes. */
     {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);
         auto it = c->accounts.find(accountId);
         if (it != c->accounts.end() && !it->second.self_uri.empty() &&
             from == it->second.self_uri) {
+            QueuedEvent qe;
+            stamp(qe.ev, CARRIER_EVENT_MESSAGE_SENT);
+            set_account(qe.ev, accountId);
+            copy_fixed(qe.ev.message_sent.contact_uri, CARRIER_URI_LEN, from);
+            copy_fixed(qe.ev.message_sent.conversation_id,
+                       CARRIER_CONVERSATION_ID_LEN, conversationId);
+            copy_fixed(qe.ev.message_sent.message_id,
+                       CARRIER_MESSAGE_ID_LEN, message.id);
+            qe.ev.message_sent.status = 0;
+            carrier_push_event(c, std::move(qe));
             return;
         }
     }
