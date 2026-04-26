@@ -3,9 +3,8 @@
  *  carrier-cli: Streaming CLI for the Carrier library.
  *  Reads RDF Turtle commands from stdin, emits events to stdout.
  *
- *  M2 scope: lifecycle, account creation/loading, self-ID, trust, 1:1
- *  messaging. Pipe mode was removed with the Tox backend; see D12 in
- *  arch/jami-migration.md.
+ *  Scope follows carrier.h. Pipe mode was removed in the v0.2
+ *  vocabulary break; see D12 in arch/jami-migration.md.
  *
  *  This file is part of Carrier. Carrier is free software licensed
  *  under the MIT License.

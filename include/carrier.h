@@ -29,7 +29,7 @@
  *  v3.2 break (M4a): `message_id` is now a 40-hex Swarm commit hash
  *  (`char[CARRIER_MESSAGE_ID_LEN]`) on every event that carries one,
  *  matching libjami's ground truth. The v3.1 `uint64_t message_id` was a
- *  Tox-era artifact — Jami never had numeric message IDs.
+ *  v0.1 carryover — Jami never had numeric message IDs.
  *
  *  Threading: libjami signals fire on daemon worker threads. The shim
  *  marshals them into a bounded queue + clock fd (eventfd on Linux, self-pipe
