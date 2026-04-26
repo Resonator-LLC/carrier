@@ -79,19 +79,41 @@ git -C "$SRC_DIR" checkout --quiet "$SHA"
 git -C "$SRC_DIR" submodule update --init --recursive
 
 # 2. Build contrib deps. The contrib system can detect existing system
-# libraries (e.g. brew-installed gnutls) and skip vendoring them. That
-# leaves pjproject's --with-gnutls=yes pointing at default search paths
-# that miss Apple Silicon's /opt/homebrew/include — which is the issue
-# the now-deleted 0001-macos-pjproject-gnutls-prefix.patch worked around.
+# libraries (e.g. brew-installed gnutls, apt-installed opus) and skip
+# vendoring them — but its pkg-config plumbing then mis-fires when the
+# downstream configure scripts try to actually link them. Notably,
+# pjproject's --with-gnutls=yes misses Apple Silicon's /opt/homebrew/include
+# (the issue the now-deleted 0001-macos-pjproject-gnutls-prefix.patch
+# worked around), and ffmpeg's configure on Ubuntu fails with
+# "opus not found" because dpkg-query auto-detection adds opus to
+# PKGS_FOUND but its .pc files aren't on the search path used at
+# configure time.
 #
-# --ignore-system-libs forces every dep to be source-built. Hermetic,
-# slower first time, no patch. Tarballs are cached across SHAs via
-# --cache-dir so SHA bumps don't re-download identical archives.
+# --ignore-system-libs forces every dep to be source-built; PKGS_FOUND
+# is ignored regardless of pkg-config / dpkg state. Hermetic, slower
+# first time, no patch.
+#
+# Tarballs are pooled across SHA bumps via a symlink: the contrib
+# default location (contrib/tarballs) points at $TARBALL_CACHE so
+# upstream archives downloaded for one SHA serve every later SHA.
+# Using a symlink instead of bootstrap's --cache-dir flag avoids
+# contrib's "custom TARBALLS location requires flock" guard, which
+# would otherwise need flock(1) — not shipped by default on macOS.
 echo "==> Building contrib (hermetic; may take 30-90 min)"
-mkdir -p "$SRC_DIR/contrib/native" "$TARBALL_CACHE"
+mkdir -p "$SRC_DIR/contrib" "$SRC_DIR/contrib/native" "$TARBALL_CACHE"
+# Migrate any pre-existing per-SHA tarballs into the shared cache before
+# replacing the directory with a symlink. Idempotent on re-runs.
+if [ -d "$SRC_DIR/contrib/tarballs" ] && [ ! -L "$SRC_DIR/contrib/tarballs" ]; then
+  for f in "$SRC_DIR/contrib/tarballs"/*; do
+    [ -e "$f" ] || continue
+    mv -n "$f" "$TARBALL_CACHE/" 2>/dev/null || true
+  done
+  rm -rf "$SRC_DIR/contrib/tarballs"
+fi
+ln -sfn "$TARBALL_CACHE" "$SRC_DIR/contrib/tarballs"
 (
   cd "$SRC_DIR/contrib/native"
-  ../bootstrap --ignore-system-libs --cache-dir="$TARBALL_CACHE"
+  ../bootstrap --ignore-system-libs
   make -j"$NPROC"
 )
 
