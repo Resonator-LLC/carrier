@@ -115,22 +115,34 @@ JAMI_CONTRIB_LIBS = \
     $(JAMI_CONTRIB_LIB)/libzstd.a \
     $(JAMI_CONTRIB_LIB)/libbzip2.a \
     $(JAMI_CONTRIB_LIB)/libsecp256k1.a \
-    $(JAMI_CONTRIB_LIB)/libyaml-cpp.a
+    $(JAMI_CONTRIB_LIB)/libyaml-cpp.a \
+    $(JAMI_CONTRIB_LIB)/libgit2.a \
+    $(JAMI_CONTRIB_LIB)/libjsoncpp.a \
+    $(JAMI_CONTRIB_LIB)/libopus.a \
+    $(JAMI_CONTRIB_LIB)/libvpx.a \
+    $(JAMI_CONTRIB_LIB)/libargon2.a \
+    $(JAMI_CONTRIB_LIB)/libgnutls.a \
+    $(JAMI_CONTRIB_LIB)/libhogweed.a \
+    $(JAMI_CONTRIB_LIB)/libnettle.a \
+    $(JAMI_CONTRIB_LIB)/libgmp.a \
+    $(JAMI_CONTRIB_LIB)/libssl.a \
+    $(JAMI_CONTRIB_LIB)/libcrypto.a \
+    $(JAMI_CONTRIB_LIB)/libtls.a \
+    $(JAMI_CONTRIB_LIB)/libz.a
 
 LDFLAGS += $(JAMI_CONTRIB_LIBS)
 
-# Homebrew-provided deps on macOS (GnuTLS, libgit2, jsoncpp, secp256k1, yaml-cpp)
+# All third-party C/C++ deps come from contrib (hermetic build, see D21).
+# Only system frameworks + the C runtime are pulled from outside the prefix.
 ifeq ($(UNAME_S), Darwin)
-LDFLAGS += $(shell pkg-config --libs gnutls nettle hogweed libgit2 jsoncpp vpx opus openssl libargon2 gmp 2>/dev/null)
 LDFLAGS += -framework AVFoundation -framework CoreAudio -framework CoreVideo -framework CoreMedia -framework CoreGraphics
 LDFLAGS += -framework VideoToolbox -framework AudioUnit -framework Foundation
 LDFLAGS += -framework CoreFoundation -framework Security -framework SystemConfiguration
-LDFLAGS += -lcompression -lresolv -lc++ -lz -liconv
+LDFLAGS += -lcompression -lresolv -lc++ -liconv
 endif
 
 ifeq ($(UNAME_S), Linux)
-LDFLAGS += $(shell pkg-config --libs gnutls nettle hogweed libgit2 jsoncpp libsecp256k1 yaml-cpp openssl libargon2 gmp 2>/dev/null)
-LDFLAGS += -lstdc++ -ldl -lrt -lresolv -lz
+LDFLAGS += -lstdc++ -ldl -lrt -lresolv
 endif
 
 LDFLAGS += -lpthread
