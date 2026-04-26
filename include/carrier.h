@@ -16,12 +16,13 @@
  *  Scope as of M4a (this header): lifecycle, account creation/loading,
  *  self-ID, trust requests, 1:1 text messaging, multi-party Swarm
  *  conversations (create, send, accept/decline invitation, invite member,
- *  remove), reactions, continuous presence, and Swarm file transfers
+ *  remove), reactions, continuous presence, Swarm file transfers
  *  (offer/accept/cancel via DataTransferSignal::DataTransferEvent and
- *  inbound `application/data-transfer+json` commits). Device linking and
- *  calls (audio/video) deferred to later milestones. Functions and event
- *  types are added as they land — there are no forward-declared
- *  placeholders for unimplemented surface.
+ *  inbound `application/data-transfer+json` commits), and device linking
+ *  (new-device account-creation in linking mode, source-device authorize,
+ *  revoke). Calls (audio/video) deferred to M4b. Functions and event types
+ *  are added as they land — there are no forward-declared placeholders for
+ *  unimplemented surface.
  *
  *  v3.2 break (M4a): `message_id` is now a 40-hex Swarm commit hash
  *  (`char[CARRIER_MESSAGE_ID_LEN]`) on every event that carries one,
@@ -78,6 +79,8 @@ typedef struct Carrier Carrier;
 #define CARRIER_STATUS_LEN            16  /* presence status string ("online", "offline", ...) */
 #define CARRIER_FILE_ID_LEN           96  /* "<40hex>_<digits>[.<ext>]" file identifier */
 #define CARRIER_PATH_LEN            1024  /* file system path */
+#define CARRIER_DEVICE_ID_LEN         96  /* Jami device fingerprint (40-hex DH or 64-hex Ed25519) */
+#define CARRIER_PIN_LEN              128  /* "jami-auth://<40-or-64-hex>/<6char>" import token */
 
 /* ---------------------------------------------------------------------------
  * Event types
@@ -107,6 +110,9 @@ typedef enum {
     CARRIER_EVENT_FILE_RECV,                /* incoming file-transfer offer in a Swarm */
     CARRIER_EVENT_FILE_PROGRESS,            /* file transfer started (per-direction, single-shot) */
     CARRIER_EVENT_FILE_COMPLETE,            /* file transfer reached terminal state */
+    CARRIER_EVENT_DEVICE_LINK_PIN,          /* new-device side: import token minted (carries pin) */
+    CARRIER_EVENT_DEVICE_LINKED,            /* device joined the account's known set */
+    CARRIER_EVENT_DEVICE_UNLINKED,          /* device left the account's known set (e.g. revoked) */
     CARRIER_EVENT_ERROR,                    /* command-level failure */
     CARRIER_EVENT_SYSTEM,                   /* operational notice */
 } CarrierEventType;
@@ -302,6 +308,31 @@ typedef struct {
             char file_id[CARRIER_FILE_ID_LEN];
             char status[CARRIER_STATUS_LEN];
         } file_complete;
+
+        /* Device-linking import token. Emitted on a new device after
+         * carrier_create_linking_account, when libjami mints the
+         * `jami-auth://...` URI. The URI is valid for ~5 minutes; pass it
+         * to an already-linked device via carrier_authorize_device. */
+        struct {
+            char pin[CARRIER_PIN_LEN];
+        } device_link_pin;
+
+        /* A device joined the account's known-devices set. Fires on every
+         * device that sees the change — on the source side after
+         * carrier_authorize_device completes, and on a freshly-linked new
+         * device when its first KnownDevicesChanged populates beyond the
+         * initial seed. `device_id` is the 40- or 64-hex fingerprint. */
+        struct {
+            char device_id[CARRIER_DEVICE_ID_LEN];
+        } device_linked;
+
+        /* A device was revoked from the account. Fires on the revoking
+         * device after libjami's DeviceRevocationEnded(SUCCESS). Other
+         * observers learn of the revocation via certificate-revocation-list
+         * propagation, not as a typed event today. */
+        struct {
+            char device_id[CARRIER_DEVICE_ID_LEN];
+        } device_unlinked;
 
         /* A command was rejected. `command` is the RDF local name (e.g.
          * "SendTrustRequest") when triaged at the dispatch layer; otherwise
@@ -803,6 +834,79 @@ int carrier_cancel_file(Carrier    *c,
                         const char *account_id,
                         const char *conversation_id,
                         const char *file_id);
+
+/* ---------------------------------------------------------------------------
+ * Device linking
+ *
+ * libjami's flow is asymmetric:
+ *   - The new device creates an account in linking-mode (archive_url =
+ *     "jami-auth"), and libjami emits a `jami-auth://...` import URI via
+ *     ConfigurationSignal::DeviceAuthStateChanged(TOKEN_AVAILABLE). The shim
+ *     surfaces that as CARRIER_EVENT_DEVICE_LINK_PIN.
+ *   - The user copies the URI to an already-linked device, which calls
+ *     carrier_authorize_device. libjami's AddDeviceStateChanged hits
+ *     AUTHENTICATING (the shim auto-confirms via confirmAddDevice), then
+ *     DONE+success completes the auth channel. Both sides eventually see a
+ *     KnownDevicesChanged carrying the new device, which the shim diffs
+ *     against a per-account cache to emit CARRIER_EVENT_DEVICE_LINKED.
+ *   - carrier_revoke_device runs the inverse on the source side. libjami's
+ *     KnownDevicesChanged does NOT fire on remove, so the shim binds
+ *     ConfigurationSignal::DeviceRevocationEnded and emits
+ *     CARRIER_EVENT_DEVICE_UNLINKED on success.
+ *
+ * URI lifetime is ~5 minutes (libjami's OP_TIMEOUT). The shim assumes
+ * archives have no password (matching carrier_create_account); password-
+ * protected linking would need a follow-up API to feed the password back.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Begin device-linking on a NEW device. Creates a fresh account in
+ * linking-mode and asks libjami to mint an import token. Once libjami
+ * mints the URI, CARRIER_EVENT_DEVICE_LINK_PIN fires carrying it; once the
+ * source device authorizes the token and the archive transfers, the
+ * standard CARRIER_EVENT_ACCOUNT_READY path fires with the shared self URI.
+ *
+ * out_account_id: the linking-mode account handle, populated synchronously.
+ *                 Subsequent commands (e.g. SubscribePresence on the
+ *                 freshly-synced contact list) target this account_id.
+ *                 Note that until ACCOUNT_READY arrives, calling
+ *                 account-scoped APIs on this id will fail.
+ *
+ * Returns 0 on success, -1 on libjami failure.
+ */
+int carrier_create_linking_account(Carrier *c,
+                                   char     out_account_id[CARRIER_ACCOUNT_ID_LEN]);
+
+/*
+ * Authorize a device-link import URI on the SOURCE (already-linked) side.
+ *
+ * pin: the `jami-auth://...` URI from a CARRIER_EVENT_DEVICE_LINK_PIN
+ *      event on the new device. Validated by libjami; invalid URIs return
+ *      a negative op_id and surface as CARRIER_EVENT_ERROR with
+ *      class="DeviceLink".
+ *
+ * On success, libjami runs the auth channel; CARRIER_EVENT_DEVICE_LINKED
+ * fires once the new device's fingerprint propagates into the source's
+ * known-devices set. On failure the shim emits a DONE-state Error.
+ *
+ * Returns 0 on enqueue, -1 on validation / libjami failure.
+ */
+int carrier_authorize_device(Carrier    *c,
+                             const char *account_id,
+                             const char *pin);
+
+/*
+ * Revoke a previously-linked device. Removes the deviceId from the
+ * account's certificate authority; KnownDevicesChanged fires with the
+ * device gone, and CARRIER_EVENT_DEVICE_UNLINKED follows.
+ *
+ * device_id: 40- or 64-hex fingerprint, as seen in DEVICE_LINKED.device_id.
+ *
+ * Returns 0 on enqueue, -1 if libjami's revokeDevice rejects the id.
+ */
+int carrier_revoke_device(Carrier    *c,
+                          const char *account_id,
+                          const char *device_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

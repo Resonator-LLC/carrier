@@ -200,12 +200,14 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -d, --data-dir PATH      Jami data dir (default: platform default)\n");
     fprintf(stderr, "  -a, --account ID         Load an existing account by libjami ID\n");
     fprintf(stderr, "      --create-account N   Create a fresh account with display name N\n");
+    fprintf(stderr, "      --link-account       Create a new account in linking mode and\n");
+    fprintf(stderr, "                           print the import URI (DeviceLinkPin event)\n");
     fprintf(stderr, "      --fifo-in PATH       Read from named pipe instead of stdin\n");
     fprintf(stderr, "      --fifo-out PATH      Write to named pipe instead of stdout\n");
     fprintf(stderr, "      --log LEVEL          error|warn|info|debug (default: error;\n");
     fprintf(stderr, "                           falls back to CARRIER_LOG env var)\n");
     fprintf(stderr, "  -h, --help               Show this help\n");
-    fprintf(stderr, "\nCarrier-cli requires exactly one of --account or --create-account.\n");
+    fprintf(stderr, "\nCarrier-cli requires exactly one of --account, --create-account, or --link-account.\n");
 }
 
 int main(int argc, char **argv)
@@ -213,6 +215,7 @@ int main(int argc, char **argv)
     const char *data_dir       = NULL;
     const char *account_id     = NULL;
     const char *create_display = NULL;
+    bool        link_account   = false;
     const char *fifo_in_path   = NULL;
     const char *fifo_out_path  = NULL;
     const char *log_level_arg  = NULL;
@@ -221,6 +224,7 @@ int main(int argc, char **argv)
         {"data-dir",       required_argument, 0, 'd'},
         {"account",        required_argument, 0, 'a'},
         {"create-account", required_argument, 0, 'C'},
+        {"link-account",   no_argument,       0, 'K'},
         {"fifo-in",        required_argument, 0, 'I'},
         {"fifo-out",       required_argument, 0, 'O'},
         {"log",            required_argument, 0, 'L'},
@@ -234,6 +238,7 @@ int main(int argc, char **argv)
             case 'd': data_dir = optarg; break;
             case 'a': account_id = optarg; break;
             case 'C': create_display = optarg; break;
+            case 'K': link_account = true; break;
             case 'I': fifo_in_path = optarg; break;
             case 'O': fifo_out_path = optarg; break;
             case 'L': log_level_arg = optarg; break;
@@ -242,8 +247,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if ((account_id && create_display) || (!account_id && !create_display)) {
-        fprintf(stderr, "carrier: exactly one of --account or --create-account required\n");
+    int mode_count = (account_id ? 1 : 0) + (create_display ? 1 : 0) + (link_account ? 1 : 0);
+    if (mode_count != 1) {
+        fprintf(stderr, "carrier: exactly one of --account, --create-account, or --link-account required\n");
         return 1;
     }
 
@@ -297,6 +303,14 @@ int main(int argc, char **argv)
             return 1;
         }
         fprintf(stderr, "carrier: created account %s\n", new_id);
+    } else if (link_account) {
+        char new_id[CARRIER_ACCOUNT_ID_LEN];
+        if (carrier_create_linking_account(c, new_id) != 0) {
+            fprintf(stderr, "carrier: carrier_create_linking_account failed\n");
+            carrier_free(c);
+            return 1;
+        }
+        fprintf(stderr, "carrier: created linking-mode account %s\n", new_id);
     } else {
         if (carrier_load_account(c, account_id) != 0) {
             fprintf(stderr, "carrier: carrier_load_account(%s) failed\n", account_id);

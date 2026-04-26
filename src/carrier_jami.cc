@@ -729,3 +729,77 @@ extern "C" int carrier_cancel_file(Carrier    *c,
     const auto err = libjami::cancelDataTransfer(account_id, conversation_id, file_id);
     return (err == libjami::DataTransferError::success) ? 0 : -1;
 }
+
+/* ---------------------------------------------------------------------------
+ * Device linking
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_create_linking_account(Carrier *c,
+                                              char     out_account_id[CARRIER_ACCOUNT_ID_LEN])
+{
+    if (!c || !out_account_id) return -1;
+
+    /* Setting Account.archiveURL to "jami-auth" puts the new account into
+     * libjami's linking-mode flow: the daemon mints a temporary DHT identity,
+     * emits ConfigurationSignal::DeviceAuthStateChanged(TOKEN_AVAILABLE) with
+     * the import URI, and waits for an addDevice() call from a peer. See
+     * jamiaccount.cpp:1321 (archive_url branch in buildAccountCredentials)
+     * and archive_account_manager.cpp:577 (URI minting). */
+    std::map<std::string, std::string> details;
+    details["Account.type"]               = "RING";
+    details["Account.archiveURL"]         = "jami-auth";
+    details["Account.archiveHasPassword"] = "false";
+    details["Account.archivePassword"]    = "";
+
+    const std::string accountId = libjami::addAccount(details);
+    if (accountId.empty()) {
+        emit_error(c, "", "LinkDevice", "LibjamiFailure",
+                   "addAccount(linking-mode) returned empty id");
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        (void) c->accounts[accountId];   /* default-construct empty AccountState */
+    }
+
+    copy_to(out_account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
+    CLOG_INFO(c, "SHIM", "created linking-mode account %s", accountId.c_str());
+    return 0;
+}
+
+extern "C" int carrier_authorize_device(Carrier    *c,
+                                        const char *account_id,
+                                        const char *pin)
+{
+    if (!c || !account_id || !pin || !*pin) return -1;
+
+    /* libjami::addDevice returns op_id on success or a negative
+     * AddDeviceError: -1 INVALID_URI, -2 ALREADY_LINKING, -3 GENERIC.
+     * See account_manager.h:152 for the enum. */
+    const int32_t op_id = libjami::addDevice(account_id, pin);
+    if (op_id < 0) {
+        const char *cause = "addDevice failed";
+        if (op_id == -1) cause = "invalid jami-auth:// URI";
+        else if (op_id == -2) cause = "another linking already in progress";
+        emit_error(c, account_id, "AuthorizeDevice", "DeviceLink", cause);
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int carrier_revoke_device(Carrier    *c,
+                                     const char *account_id,
+                                     const char *device_id)
+{
+    if (!c || !account_id || !device_id || !*device_id) return -1;
+
+    /* Empty scheme/password matches our no-password assumption (M4a-3).
+     * libjami::revokeDevice's bool return is always false — the actual
+     * outcome arrives async via ConfigurationSignal::DeviceRevocationEnded
+     * (which we don't bind today; the success path emits DeviceUnlinked
+     * via the KnownDevicesChanged diff). Don't treat the return as an
+     * error indicator. See archive_account_manager.cpp:1468. */
+    libjami::revokeDevice(account_id, device_id, "", "");
+    return 0;
+}

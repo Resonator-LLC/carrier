@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -74,6 +76,15 @@ struct AccountState
      * for a given conversation, and on carrier_create_conversation /
      * carrier_accept_conversation_request. Guarded by accounts_mtx. */
     std::unordered_map<std::string, std::string> conversation_modes;
+
+    /* Snapshot of the account's known device fingerprints, diffed against
+     * incoming KnownDevicesChanged signals to surface DeviceLinked /
+     * DeviceUnlinked. `nullopt` means the cache hasn't been populated yet —
+     * the first KnownDevicesChanged for the account seeds it without
+     * emitting events (handles both bootstrapping a long-lived account on
+     * load and a freshly-linked new device learning about its siblings).
+     * Subsequent events diff against the seeded set. */
+    std::optional<std::set<std::string>> known_devices;
 };
 
 /* ---------------------------------------------------------------------------

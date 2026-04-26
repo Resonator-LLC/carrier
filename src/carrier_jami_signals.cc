@@ -624,6 +624,203 @@ void on_data_transfer_event(Carrier *c,
                        fileId.c_str(), eventCode);
 }
 
+/* ---------------------------------------------------------------------------
+ * Device-linking handlers
+ *
+ * libjami's flow is asymmetric:
+ *   - New device side: ConfigurationSignal::DeviceAuthStateChanged drives a
+ *     state machine (INIT → TOKEN_AVAILABLE → CONNECTING → AUTHENTICATING →
+ *     IN_PROGRESS → DONE). We surface only TOKEN_AVAILABLE (as DeviceLinkPin)
+ *     and DONE+error (as Error). Intermediate states are suppressed; the
+ *     handler auto-calls provideAccountAuthentication("") on the first
+ *     AUTHENTICATING (M4a-3 assumes no-password archives).
+ *   - Source side and post-link discovery: ConfigurationSignal::
+ *     KnownDevicesChanged carries the full known-devices map. We diff
+ *     against a per-account snapshot — first sighting seeds without
+ *     emitting; subsequent additions emit DeviceLinked, removals emit
+ *     DeviceUnlinked.
+ *
+ * Vocab for these is in arch/ontology/carrier.ttl v0.2.5: LinkDevice,
+ * AuthorizeDevice (commands), DeviceLinkPin, DeviceLinked, DeviceUnlinked,
+ * RevokeDevice. carrier:pin carries the URI; carrier:contactUri carries the
+ * device fingerprint (40-hex DH or 64-hex Ed25519).
+ * ---------------------------------------------------------------------------*/
+
+/* SOURCE side state machine. The handler does two things:
+ *   1. On AUTHENTICATING (state=3) — call libjami::confirmAddDevice(op_id)
+ *      to gate the new device past its handshake. Without this, the auth
+ *      channel hangs and times out (5min OP_TIMEOUT). Confirmed via
+ *      libjami's own unitTest/linkdevice/linkdevice.cpp:302.
+ *   2. On DONE+error — surface as carrier:Error{class="DeviceLink"}.
+ * Intermediate states are suppressed; DeviceLinked rides on
+ * KnownDevicesChanged for correct post-link timing. */
+void on_add_device_state_changed(Carrier *c,
+                                 const std::string &accountId,
+                                 std::uint32_t op_id,
+                                 int state,
+                                 const std::map<std::string, std::string> &detail)
+{
+    constexpr int AUTHENTICATING = 3;
+    constexpr int DONE           = 5;
+
+    if (state == AUTHENTICATING) {
+        /* Auth channel is up; new device is asking us to verify. Confirm so
+         * the flow advances. The shim assumes M4a-3 no-password archives,
+         * so there's no UI step here — confirm immediately. */
+        libjami::confirmAddDevice(accountId, op_id);
+        return;
+    }
+
+    if (state != DONE) return;
+    auto err = detail.find("error");
+    if (err == detail.end() || err->second.empty()) return;
+    carrier_emit_error(c, "AuthorizeDevice", "DeviceLink",
+                       "device-linking failed: %s", err->second.c_str());
+}
+
+void on_device_auth_state_changed(Carrier *c,
+                                  const std::string &accountId,
+                                  int state,
+                                  const std::map<std::string, std::string> &detail)
+{
+    /* States from archive_account_manager.h:28
+     * (DeviceAuthState enum):
+     *   0 INIT, 1 TOKEN_AVAILABLE, 2 CONNECTING, 3 AUTHENTICATING,
+     *   4 IN_PROGRESS, 5 DONE.
+     * Detail keys from the same file: "token", "auth_scheme", "peer_id",
+     * "peer_address", "auth_error", "error". */
+    constexpr int TOKEN_AVAILABLE = 1;
+    constexpr int AUTHENTICATING  = 3;
+    constexpr int DONE            = 5;
+
+    if (state == TOKEN_AVAILABLE) {
+        auto it = detail.find("token");
+        if (it == detail.end() || it->second.empty()) return;
+
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_DEVICE_LINK_PIN);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.device_link_pin.pin, CARRIER_PIN_LEN, it->second);
+        carrier_push_event(c, std::move(qe));
+        return;
+    }
+
+    if (state == AUTHENTICATING) {
+        /* Source has connected and is asking us to verify. M4a-3 assumes
+         * no-password archives — call provideAccountAuthentication blindly
+         * with an empty password on the first AUTHENTICATING (no
+         * auth_error key). On retry signals (auth_error="invalid_credentials")
+         * we suppress; the libjami flow will time out at maxTries and the
+         * subsequent DONE+error branch will surface the failure. */
+        if (detail.find("auth_error") == detail.end()) {
+            libjami::provideAccountAuthentication(accountId, "", "password");
+        }
+        return;
+    }
+
+    if (state == DONE) {
+        auto err = detail.find("error");
+        if (err == detail.end() || err->second.empty()) {
+            /* Success: AccountReady fires through the standard
+             * RegistrationStateChanged path; nothing to emit here. */
+            return;
+        }
+        carrier_emit_error(c, "LinkDevice", "DeviceLink",
+                           "device-linking failed: %s", err->second.c_str());
+        return;
+    }
+
+    /* INIT (0), CONNECTING (2), IN_PROGRESS (4): intermediate, no emission. */
+}
+
+/* Revocation surfaces via DeviceRevocationEnded (NOT KnownDevicesChanged —
+ * libjami's contact_list.cpp:560 erases the device but does NOT fire the
+ * "changed" callback on remove paths). The status int is
+ * AccountManager::RevokeDeviceResult: 0=SUCCESS, 1=ERROR_CREDENTIALS,
+ * 2=ERROR_NETWORK. */
+void on_device_revocation_ended(Carrier *c,
+                                const std::string &accountId,
+                                const std::string &deviceId,
+                                int status)
+{
+    if (status == 0) {
+        /* Update our cache so a subsequent KnownDevicesChanged (which won't
+         * fire for this remove anyway) doesn't get a stale "removed" entry. */
+        {
+            std::lock_guard<std::mutex> lock(c->accounts_mtx);
+            auto it = c->accounts.find(accountId);
+            if (it != c->accounts.end() && it->second.known_devices.has_value()) {
+                it->second.known_devices->erase(deviceId);
+            }
+        }
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_DEVICE_UNLINKED);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.device_unlinked.device_id, CARRIER_DEVICE_ID_LEN, deviceId);
+        carrier_push_event(c, std::move(qe));
+        return;
+    }
+    const char *cause = (status == 1) ? "invalid_credentials" :
+                        (status == 2) ? "network" :
+                                        "unknown";
+    carrier_emit_error(c, "RevokeDevice", "DeviceLink",
+                       "revoke %s failed: %s", deviceId.c_str(), cause);
+}
+
+void on_known_devices_changed(Carrier *c,
+                              const std::string &accountId,
+                              const std::map<std::string, std::string> &devices)
+{
+    /* Diff against per-account snapshot. First sighting seeds the cache
+     * silently — both for an existing account being loaded (the seed is
+     * the persisted device set) and for a freshly-linked new device (the
+     * seed includes the source plus self). Subsequent changes diff. */
+    std::set<std::string> incoming;
+    for (const auto &kv : devices) {
+        incoming.insert(kv.first);
+    }
+
+    std::set<std::string> added;
+    std::set<std::string> removed;
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        auto it = c->accounts.find(accountId);
+        if (it == c->accounts.end()) {
+            /* Untracked account — ignore. Linking-mode accounts are
+             * registered into the map at create time. */
+            return;
+        }
+        AccountState &st = it->second;
+        if (!st.known_devices.has_value()) {
+            st.known_devices = std::move(incoming);
+            return;   /* seed only, no emission */
+        }
+        const auto &cached = *st.known_devices;
+        for (const auto &id : incoming) {
+            if (cached.find(id) == cached.end()) added.insert(id);
+        }
+        for (const auto &id : cached) {
+            if (incoming.find(id) == incoming.end()) removed.insert(id);
+        }
+        st.known_devices = std::move(incoming);
+    }
+
+    for (const auto &id : added) {
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_DEVICE_LINKED);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.device_linked.device_id, CARRIER_DEVICE_ID_LEN, id);
+        carrier_push_event(c, std::move(qe));
+    }
+    for (const auto &id : removed) {
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_DEVICE_UNLINKED);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.device_unlinked.device_id, CARRIER_DEVICE_ID_LEN, id);
+        carrier_push_event(c, std::move(qe));
+    }
+}
+
 } /* anonymous namespace */
 
 /* ---------------------------------------------------------------------------
@@ -716,6 +913,29 @@ void carrier_register_signals(Carrier *c)
             int eventCode) {
             on_data_transfer_event(c, accountId, conversationId,
                                    interactionId, fileId, eventCode);
+        }));
+
+    handlers.insert(exportable_callback<CS::DeviceAuthStateChanged>(
+        [c](const std::string &accountId, int state,
+            const std::map<std::string, std::string> &detail) {
+            on_device_auth_state_changed(c, accountId, state, detail);
+        }));
+
+    handlers.insert(exportable_callback<CS::AddDeviceStateChanged>(
+        [c](const std::string &accountId, std::uint32_t op_id, int state,
+            const std::map<std::string, std::string> &detail) {
+            on_add_device_state_changed(c, accountId, op_id, state, detail);
+        }));
+
+    handlers.insert(exportable_callback<CS::KnownDevicesChanged>(
+        [c](const std::string &accountId,
+            const std::map<std::string, std::string> &devices) {
+            on_known_devices_changed(c, accountId, devices);
+        }));
+
+    handlers.insert(exportable_callback<CS::DeviceRevocationEnded>(
+        [c](const std::string &accountId, const std::string &deviceId, int status) {
+            on_device_revocation_ended(c, accountId, deviceId, status);
         }));
 
     libjami::registerSignalHandlers(handlers);

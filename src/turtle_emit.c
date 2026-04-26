@@ -311,6 +311,27 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fputc('"', out);
             break;
 
+        case CARRIER_EVENT_DEVICE_LINK_PIN:
+            emit_header(out, "DeviceLinkPin", ev->account_id);
+            fprintf(out, " ; carrier:pin \"");
+            turtle_escape(out, ev->device_link_pin.pin);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_DEVICE_LINKED:
+            emit_header(out, "DeviceLinked", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->device_linked.device_id);
+            fputc('"', out);
+            break;
+
+        case CARRIER_EVENT_DEVICE_UNLINKED:
+            emit_header(out, "DeviceUnlinked", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->device_unlinked.device_id);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_ERROR:
             emit_header(out, "Error", ev->account_id);
             fprintf(out, " ; carrier:command \"");

@@ -464,6 +464,42 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- Device linking --- */
+
+    if (strcmp(stmt->type, "LinkDevice") == 0) {
+        char new_id[CARRIER_ACCOUNT_ID_LEN];
+        if (carrier_create_linking_account(c, new_id) != 0) {
+            /* carrier_create_linking_account already emitted an Error. */
+        }
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "AuthorizeDevice") == 0) {
+        const char *account = require_account(c, stmt, "AuthorizeDevice");
+        if (!account) return 0;
+        const char *pin = find_pred(stmt, "pin");
+        if (!pin) {
+            carrier_emit_error(c, "AuthorizeDevice", "MissingField",
+                               "carrier:pin required");
+            return 0;
+        }
+        carrier_authorize_device(c, account, pin);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "RevokeDevice") == 0) {
+        const char *account = require_account(c, stmt, "RevokeDevice");
+        if (!account) return 0;
+        const char *device_id = find_pred(stmt, "contactUri");
+        if (!device_id) {
+            carrier_emit_error(c, "RevokeDevice", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
+        }
+        carrier_revoke_device(c, account, device_id);
+        return 0;
+    }
+
     /* --- Meta --- */
 
     if (strcmp(stmt->type, "Quit") == 0) {
