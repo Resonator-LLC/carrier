@@ -80,15 +80,15 @@ git -C "$SRC_DIR" submodule update --init --recursive
 
 # 2. Build contrib deps. We follow the daemon's official build path
 # (README "Compile the dependencies"): bootstrap from contrib/native,
-# then make. The official docker build trusts apt-detected system libs;
-# we mirror that on Linux. On macOS, brew's /opt/homebrew prefix isn't
-# on pjproject's default search paths (the issue the now-deleted
-# 0001-macos-pjproject-gnutls-prefix.patch worked around), so we pass
-# --ignore-system-libs to force every dep source-built and avoid the
-# brew/contrib path mismatch. Linux's dpkg detection works correctly
-# once libsystemd-dev / libva-dev / etc. are installed (see the apt
-# list in build-libjami-artifacts.yml, which mirrors the daemon's
-# top-level Dockerfile).
+# then make. No flags — the official Dockerfile doesn't pass any to
+# bootstrap either. With the full apt list installed on Linux (see
+# build-libjami-artifacts.yml, which mirrors the daemon's top-level
+# Dockerfile) contrib's dpkg detection adds the right packages to
+# PKGS_FOUND. On macOS, the README brew list installs *tools only*
+# (no libraries), so contrib auto-detects nothing system-wide and
+# source-builds every dep — except `iconv`, which is unconditionally
+# PKGS_FOUND on POSIX (rules.mak:10-11) and links against macOS's
+# system libiconv (the `_iconv_open` symbol family).
 #
 # Tarballs are pooled across SHA bumps via a symlink: the contrib
 # default location (contrib/tarballs) points at $TARBALL_CACHE so
@@ -108,13 +108,9 @@ if [ -d "$SRC_DIR/contrib/tarballs" ] && [ ! -L "$SRC_DIR/contrib/tarballs" ]; t
   rm -rf "$SRC_DIR/contrib/tarballs"
 fi
 ln -sfn "$TARBALL_CACHE" "$SRC_DIR/contrib/tarballs"
-case "$(uname -s)" in
-  Darwin) BOOTSTRAP_FLAGS="--ignore-system-libs" ;;
-  *)      BOOTSTRAP_FLAGS="" ;;
-esac
 (
   cd "$SRC_DIR/contrib/native"
-  ../bootstrap $BOOTSTRAP_FLAGS
+  ../bootstrap
   make -j"$NPROC"
 )
 
