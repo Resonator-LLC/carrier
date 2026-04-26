@@ -25,8 +25,10 @@ SHA="$(tr -d '[:space:]' < "$PIN_FILE")"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/resonator"
 PREFIX="$CACHE_ROOT/libjami/$SHA"
 
+# Use the portable artifact triple (no macOS kernel version) so the same
+# tarball works across macOS hosts at different kernel versions.
 case "$(uname -s)" in
-  Darwin) TRIPLE="$(uname -m)-apple-darwin$(uname -r)" ;;
+  Darwin) TRIPLE="$(uname -m)-apple-darwin" ;;
   Linux)  TRIPLE="$(uname -m)-linux-gnu" ;;
   *) echo "unsupported platform: $(uname -s)" >&2; exit 1 ;;
 esac

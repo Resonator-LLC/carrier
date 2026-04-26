@@ -28,9 +28,22 @@ CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/resonator"
 SRC_DIR="$CACHE_ROOT/libjami-src/$SHA"
 PREFIX="$CACHE_ROOT/libjami/$SHA"
 
+# Two distinct triples:
+#   BUILD_TRIPLE  - matches contrib's output dir; includes uname -r on macOS
+#   ARTIFACT_TRIPLE - portable name used for the tarball; drops the macOS
+#                     kernel version so the same artifact serves macOS hosts
+#                     across kernel versions (ABI is stable for our SDK target).
 case "$(uname -s)" in
-  Darwin) TRIPLE="$(uname -m)-apple-darwin$(uname -r)"; NPROC="$(sysctl -n hw.ncpu)" ;;
-  Linux)  TRIPLE="$(uname -m)-linux-gnu";              NPROC="$(nproc)" ;;
+  Darwin)
+    BUILD_TRIPLE="$(uname -m)-apple-darwin$(uname -r)"
+    ARTIFACT_TRIPLE="$(uname -m)-apple-darwin"
+    NPROC="$(sysctl -n hw.ncpu)"
+    ;;
+  Linux)
+    BUILD_TRIPLE="$(uname -m)-linux-gnu"
+    ARTIFACT_TRIPLE="$BUILD_TRIPLE"
+    NPROC="$(nproc)"
+    ;;
   *) echo "unsupported platform: $(uname -s)" >&2; exit 1 ;;
 esac
 
@@ -47,7 +60,7 @@ if [ "$FORCE" -eq 0 ] && [ -f "$PREFIX/lib/libjami-core.a" ]; then
   exit 0
 fi
 
-echo "==> libjami $SHA / $TRIPLE"
+echo "==> libjami $SHA / $ARTIFACT_TRIPLE (build: $BUILD_TRIPLE)"
 echo "    source: $SRC_DIR"
 echo "    prefix: $PREFIX"
 echo "    (cold build is 1-3 hours; subsequent calls reuse the cache)"
@@ -94,13 +107,14 @@ echo "==> Staging to $PREFIX"
 rm -rf "$PREFIX"
 mkdir -p "$PREFIX/lib" "$PREFIX/include/jami"
 cp "$SRC_DIR/build/libjami-core.a" "$PREFIX/lib/"
-cp "$SRC_DIR/contrib/$TRIPLE/lib/"*.a "$PREFIX/lib/"
+cp "$SRC_DIR/contrib/$BUILD_TRIPLE/lib/"*.a "$PREFIX/lib/"
 cp "$SRC_DIR/src/jami/"*.h "$PREFIX/include/jami/"
 
 cat > "$PREFIX/MANIFEST" <<EOF
 # libjami prefix manifest
 sha=$SHA
-host_triple=$TRIPLE
+artifact_triple=$ARTIFACT_TRIPLE
+build_triple=$BUILD_TRIPLE
 upstream=https://github.com/savoirfairelinux/jami-daemon
 built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF

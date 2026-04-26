@@ -68,7 +68,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool nasm yasm ninja-build cmake pkg-config \
-            build-essential git curl python3
+            build-essential git curl python3 \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libv4l-dev \
+            libudev-dev
 
       - name: Cache libjami source clone
         uses: actions/cache@v4
@@ -90,9 +92,9 @@ jobs:
         id: artifact
         run: |
           PREFIX=$(./tools/build-libjami.sh --print-prefix)
-          # Resolve the actual host triple from MANIFEST so artefact names
-          # match what consumers will expect (uname -r drift on macOS etc.)
-          TRIPLE=$(awk -F= '/^host_triple=/{print $2}' "$PREFIX/MANIFEST")
+          # Use the artifact_triple (kernel-stripped on macOS) so a single
+          # tarball serves consumers across macOS kernel versions.
+          TRIPLE=$(awk -F= '/^artifact_triple=/{print $2}' "$PREFIX/MANIFEST")
           NAME="libjami-${{ needs.prepare.outputs.sha }}-${TRIPLE}.tar.zst"
           echo "prefix=$PREFIX"  >> "$GITHUB_OUTPUT"
           echo "triple=$TRIPLE"  >> "$GITHUB_OUTPUT"
