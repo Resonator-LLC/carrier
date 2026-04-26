@@ -78,20 +78,17 @@ git -C "$SRC_DIR" fetch origin "$SHA" 2>/dev/null || true
 git -C "$SRC_DIR" checkout --quiet "$SHA"
 git -C "$SRC_DIR" submodule update --init --recursive
 
-# 2. Build contrib deps. The contrib system can detect existing system
-# libraries (e.g. brew-installed gnutls, apt-installed opus) and skip
-# vendoring them — but its pkg-config plumbing then mis-fires when the
-# downstream configure scripts try to actually link them. Notably,
-# pjproject's --with-gnutls=yes misses Apple Silicon's /opt/homebrew/include
-# (the issue the now-deleted 0001-macos-pjproject-gnutls-prefix.patch
-# worked around), and ffmpeg's configure on Ubuntu fails with
-# "opus not found" because dpkg-query auto-detection adds opus to
-# PKGS_FOUND but its .pc files aren't on the search path used at
-# configure time.
-#
-# --ignore-system-libs forces every dep to be source-built; PKGS_FOUND
-# is ignored regardless of pkg-config / dpkg state. Hermetic, slower
-# first time, no patch.
+# 2. Build contrib deps. We follow the daemon's official build path
+# (README "Compile the dependencies"): bootstrap from contrib/native,
+# then make. The official docker build trusts apt-detected system libs;
+# we mirror that on Linux. On macOS, brew's /opt/homebrew prefix isn't
+# on pjproject's default search paths (the issue the now-deleted
+# 0001-macos-pjproject-gnutls-prefix.patch worked around), so we pass
+# --ignore-system-libs to force every dep source-built and avoid the
+# brew/contrib path mismatch. Linux's dpkg detection works correctly
+# once libsystemd-dev / libva-dev / etc. are installed (see the apt
+# list in build-libjami-artifacts.yml, which mirrors the daemon's
+# top-level Dockerfile).
 #
 # Tarballs are pooled across SHA bumps via a symlink: the contrib
 # default location (contrib/tarballs) points at $TARBALL_CACHE so
@@ -99,7 +96,7 @@ git -C "$SRC_DIR" submodule update --init --recursive
 # Using a symlink instead of bootstrap's --cache-dir flag avoids
 # contrib's "custom TARBALLS location requires flock" guard, which
 # would otherwise need flock(1) — not shipped by default on macOS.
-echo "==> Building contrib (hermetic; may take 30-90 min)"
+echo "==> Building contrib (may take 30-90 min)"
 mkdir -p "$SRC_DIR/contrib" "$SRC_DIR/contrib/native" "$TARBALL_CACHE"
 # Migrate any pre-existing per-SHA tarballs into the shared cache before
 # replacing the directory with a symlink. Idempotent on re-runs.
@@ -111,20 +108,28 @@ if [ -d "$SRC_DIR/contrib/tarballs" ] && [ ! -L "$SRC_DIR/contrib/tarballs" ]; t
   rm -rf "$SRC_DIR/contrib/tarballs"
 fi
 ln -sfn "$TARBALL_CACHE" "$SRC_DIR/contrib/tarballs"
+case "$(uname -s)" in
+  Darwin) BOOTSTRAP_FLAGS="--ignore-system-libs" ;;
+  *)      BOOTSTRAP_FLAGS="" ;;
+esac
 (
   cd "$SRC_DIR/contrib/native"
-  ../bootstrap --ignore-system-libs
+  ../bootstrap $BOOTSTRAP_FLAGS
   make -j"$NPROC"
 )
 
-# 3. Build the daemon (cmake)
+# 3. Build the daemon (cmake). BUILD_CONTRIB=OFF because step 2 already
+# built contrib via contrib/native; CMake's auto-build (the README's
+# "easy way") would otherwise re-run bootstrap+make in
+# contrib/build-${TARGET}, duplicating ~30-90 min of work.
 echo "==> Building libjami (cmake)"
 rm -rf "$SRC_DIR/build"
 (
   cd "$SRC_DIR"
   cmake -S . -B build \
     -DBUILD_SHARED_LIBS=OFF \
-    -DBUILD_TESTING=OFF
+    -DBUILD_TESTING=OFF \
+    -DBUILD_CONTRIB=OFF
   cmake --build build -j"$NPROC"
 )
 

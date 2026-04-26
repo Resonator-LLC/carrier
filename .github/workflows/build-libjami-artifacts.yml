@@ -68,20 +68,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # macOS dep list mirrors README "How to compile on macOS":
+      #   automake pkg-config libtool gettext yasm
+      # plus cmake/ninja/nasm needed by the contrib build.
       - name: Install host build tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install automake libtool nasm yasm ninja cmake pkg-config
+          brew install automake libtool gettext nasm yasm ninja cmake pkg-config
 
+      # Linux dep list is the daemon's official top-level Dockerfile
+      # (jami-daemon/Dockerfile) verbatim, minus Node/SWIG (only needed
+      # for the nodejs/jni bindings) and minus libcppunit-dev/sip-tester
+      # (only needed when BUILD_TESTING=ON, which we don't enable).
       - name: Install host build tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool nasm yasm ninja-build cmake pkg-config \
-            build-essential git curl python3 \
-            libpipewire-0.3-dev libpulse-dev libasound2-dev libv4l-dev \
-            libudev-dev libva-dev libvdpau-dev
+            autoconf automake autopoint bison build-essential cmake curl git \
+            libarchive-dev libasio-dev libasound2-dev libdbus-1-dev \
+            libexpat1-dev libfmt-dev libgmp-dev nettle-dev libgnutls28-dev \
+            libjsoncpp-dev libmsgpack-dev libnatpmp-dev libopus-dev \
+            libpipewire-0.3-dev libpulse-dev libspeex-dev libspeexdsp-dev \
+            libssl-dev libsystemd-dev libtool libudev-dev libupnp-dev \
+            libva-dev libvdpau-dev libvpx-dev libx264-dev libyaml-cpp-dev \
+            libhttp-parser-dev libwebrtc-audio-processing-dev \
+            libsecp256k1-dev guile-3.0-dev nasm pkg-config yasm
 
       # We don't cache the full libjami-src tree: when a build fails partway,
       # actions/cache's post-step still saves the partial state, and the next
