@@ -910,6 +910,48 @@ int carrier_revoke_device(Carrier    *c,
                           const char *account_id,
                           const char *device_id);
 
+/* ---------------------------------------------------------------------------
+ * RDF canonicalization
+ *
+ * Implements the RDNA2015 subset needed for carrier's single-blank-node
+ * Turtle events: parse to triples, replace blank nodes with _:c14n0, sort
+ * N-Quads lines, SHA-256 the result. The hash is stable across all
+ * serializations of the same RDF graph.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Compute the canonical RDNA2015 SHA-256 hash of a Turtle document.
+ * out receives 32 bytes. Returns 0 on success, -1 on parse error.
+ */
+int carrier_rdf_hash(const char *turtle, size_t len, uint8_t out[32]);
+
+/*
+ * Copy the hash of the most recently sent message into out[32].
+ * Returns 0 if a hash is available, -1 if no message has been sent yet.
+ * The hash covers the RDF content of the message text as passed to
+ * carrier_send_message / carrier_send_conversation_message.
+ */
+int carrier_last_send_hash(const Carrier *c, uint8_t out[32]);
+
+/*
+ * Send a large RDF object as a content-addressed file over a Swarm
+ * conversation. The Turtle is written to <tmp_dir>/<hex_hash>.ttl, then
+ * sent via carrier_send_file(). The filename IS the canonical hash, so
+ * the receiver can verify integrity by hashing the received file.
+ *
+ * tmp_dir:  writable directory for the temp file (e.g. "/tmp").
+ * out_hash: if non-NULL, receives the 32-byte canonical hash on success.
+ *
+ * Returns 0 on success, -1 on hash/write/send failure.
+ */
+int carrier_send_rdf_object(Carrier    *c,
+                            const char *account_id,
+                            const char *conversation_id,
+                            const char *turtle,
+                            size_t      turtle_len,
+                            const char *tmp_dir,
+                            uint8_t     out_hash[32]);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

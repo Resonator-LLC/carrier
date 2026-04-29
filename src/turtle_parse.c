@@ -16,6 +16,7 @@
 
 #include "turtle_parse.h"
 #include "carrier_events.h"
+#include "rdf_canon.h"
 
 #include <serd/serd.h>
 
@@ -444,6 +445,60 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
             carrier_emit_error(c, "CancelFile", "LibjamiFailure",
                                "cancelDataTransfer rejected (unknown id)");
         }
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "SendRdfObject") == 0) {
+        const char *account = require_account(c, stmt, "SendRdfObject");
+        if (!account) return 0;
+        const char *conv    = find_pred(stmt, "conversationId");
+        const char *path    = find_pred(stmt, "path");
+        if (!conv || !path) {
+            carrier_emit_error(c, "SendRdfObject", "MissingField",
+                               "carrier:conversationId and carrier:path required");
+            return 0;
+        }
+        const char *tmp_dir = find_pred(stmt, "tmpDir");
+        if (!tmp_dir) tmp_dir = "/tmp";
+
+        /* Read the Turtle file. */
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            carrier_emit_error(c, "SendRdfObject", "IOError", "cannot open path");
+            return 0;
+        }
+        fseek(f, 0, SEEK_END);
+        long flen = ftell(f);
+        rewind(f);
+        if (flen <= 0 || flen > 16 * 1024 * 1024) {
+            fclose(f);
+            carrier_emit_error(c, "SendRdfObject", "IOError",
+                               "file empty or exceeds 16 MiB limit");
+            return 0;
+        }
+        char *turtle = malloc((size_t)flen + 1);
+        if (!turtle) { fclose(f); return 0; }
+        size_t read = fread(turtle, 1, (size_t)flen, f);
+        fclose(f);
+        if (read != (size_t)flen) { free(turtle); return 0; }
+        turtle[flen] = '\0';
+
+        uint8_t hash[32];
+        int ret = carrier_send_rdf_object(c, account, conv, turtle,
+                                          (size_t)flen, tmp_dir, hash);
+        free(turtle);
+
+        if (ret != 0) {
+            carrier_emit_error(c, "SendRdfObject", "SendFailed",
+                               "carrier_send_rdf_object returned error");
+            return 0;
+        }
+
+        /* Emit a System event carrying the hex-encoded hash. */
+        char hex[65];
+        for (int i = 0; i < 32; i++) snprintf(hex + i*2, 3, "%02x", hash[i]);
+        hex[64] = '\0';
+        carrier_emit_system(c, "RdfObjectSent hash=%s", hex);
         return 0;
     }
 

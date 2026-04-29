@@ -10,6 +10,7 @@
 
 #include "carrier_internal.hpp"
 #include "carrier_log.h"
+#include "rdf_canon.h"
 
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
@@ -521,6 +522,13 @@ extern "C" int carrier_send_message(Carrier    *c,
         return -1;
     }
 
+    {
+        uint8_t hash[32];
+        if (rdf_canon_hash(text, strlen(text), hash) == 0) {
+            memcpy(c->last_send_hash, hash, sizeof(hash));
+            c->has_last_send_hash = true;
+        }
+    }
     libjami::sendMessage(account_id, convId, text, /*replyTo=*/"", /*flag=*/0);
     return 0;
 }
@@ -573,6 +581,13 @@ extern "C" int carrier_send_conversation_message(Carrier    *c,
                                                  const char *text)
 {
     if (!c || !account_id || !conversation_id || !text) return -1;
+    {
+        uint8_t hash[32];
+        if (rdf_canon_hash(text, strlen(text), hash) == 0) {
+            memcpy(c->last_send_hash, hash, sizeof(hash));
+            c->has_last_send_hash = true;
+        }
+    }
     libjami::sendMessage(account_id, conversation_id, text,
                          /*replyTo=*/"", /*flag=*/0);
     return 0;
@@ -801,5 +816,61 @@ extern "C" int carrier_revoke_device(Carrier    *c,
      * via the KnownDevicesChanged diff). Don't treat the return as an
      * error indicator. See archive_account_manager.cpp:1468. */
     libjami::revokeDevice(account_id, device_id, "", "");
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * RDF canonicalization
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_rdf_hash(const char *turtle, size_t len, uint8_t out[32])
+{
+    return rdf_canon_hash(turtle, len, out);
+}
+
+extern "C" int carrier_last_send_hash(const Carrier *c, uint8_t out[32])
+{
+    if (!c || !c->has_last_send_hash) return -1;
+    memcpy(out, c->last_send_hash, 32);
+    return 0;
+}
+
+extern "C" int carrier_send_rdf_object(Carrier    *c,
+                                       const char *account_id,
+                                       const char *conversation_id,
+                                       const char *turtle,
+                                       size_t      turtle_len,
+                                       const char *tmp_dir,
+                                       uint8_t     out_hash[32])
+{
+    if (!c || !account_id || !conversation_id || !turtle || !tmp_dir) return -1;
+
+    uint8_t hash[32];
+    if (rdf_canon_hash(turtle, turtle_len, hash) != 0) return -1;
+
+    /* Build "<tmp_dir>/<64hex>.ttl" */
+    char path[4096];
+    char hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(hex + i*2, 3, "%02x", (unsigned)hash[i]);
+    hex[64] = '\0';
+    snprintf(path, sizeof(path), "%s/%s.ttl", tmp_dir, hex);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t written = fwrite(turtle, 1, turtle_len, f);
+    fclose(f);
+    if (written != turtle_len) return -1;
+
+    /* display_name is the hash filename so the receiver can verify */
+    char display_name[69]; /* "xx...xx.ttl" + NUL */
+    snprintf(display_name, sizeof(display_name), "%s.ttl", hex);
+
+    if (carrier_send_file(c, account_id, conversation_id, path, display_name) != 0)
+        return -1;
+
+    memcpy(c->last_send_hash, hash, 32);
+    c->has_last_send_hash = true;
+    if (out_hash) memcpy(out_hash, hash, 32);
     return 0;
 }

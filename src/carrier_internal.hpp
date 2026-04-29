@@ -125,6 +125,11 @@ struct Carrier
 
     std::string data_dir;            /* absolute path; exported as XDG_DATA_HOME */
     bool        libjami_initialized = false;
+
+    /* --- RDF hash --------------------------------------------------------- */
+
+    uint8_t last_send_hash[32] = {};  /* canonical hash of the most recently sent message */
+    bool    has_last_send_hash = false;
 };
 
 /* ---------------------------------------------------------------------------
