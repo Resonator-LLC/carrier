@@ -443,13 +443,21 @@ extern "C" int carrier_set_nick(Carrier *c, const char *account_id, const char *
 {
     if (!c || !account_id) return -1;
 
+    const std::string display = nick ? nick : "";
     std::map<std::string, std::string> update;
-    update["Account.displayName"] = nick ? nick : "";
+    update["Account.displayName"] = display;
     libjami::setAccountDetails(account_id, update);
+
+    /* setAccountDetails only flips the local config — peers don't learn the
+     * new name until we push a vCard commit. updateProfile does that:
+     * libjami serialises a `BEGIN:VCARD…FN:<display>…END:VCARD` blob and
+     * appends it as a Swarm commit so the peer's ProfileReceived signal
+     * fires on the other side. flag=0 keeps the existing avatar untouched. */
+    libjami::updateProfile(account_id, display, "", "", 0);
 
     std::lock_guard<std::mutex> lock(c->accounts_mtx);
     if (auto *acct = find_account(c, account_id)) {
-        acct->display_name = update["Account.displayName"];
+        acct->display_name = display;
     }
     return 0;
 }

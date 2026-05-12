@@ -85,6 +85,14 @@ struct AccountState
      * load and a freshly-linked new device learning about its siblings).
      * Subsequent events diff against the seeded set. */
     std::optional<std::set<std::string>> known_devices;
+
+    /* Cache: contact_uri → last surfaced displayName. Updated from the
+     * peer's vCard on ProfileReceived; diffed against the cached value so
+     * we only fire CARRIER_EVENT_CONTACT_NAME on first-seen or genuine
+     * rename, not on every redundant vCard re-sync (libjami re-emits the
+     * signal whenever the swarm replays the cached profile commit, e.g.
+     * on every account reconnect). Guarded by accounts_mtx. */
+    std::unordered_map<std::string, std::string> contact_names;
 };
 
 /* ---------------------------------------------------------------------------

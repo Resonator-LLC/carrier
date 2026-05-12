@@ -11,6 +11,7 @@
 
 #include "carrier_events.h"
 #include "carrier_internal.hpp"
+#include "carrier_log.h"
 
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
@@ -325,6 +326,15 @@ void on_swarm_message_received(Carrier *c,
         }
     }
 
+    /* Peer displayName lookup happens on the ProfileReceived signal, not
+     * here — libjami's SwarmMessage body for text/plain commits omits
+     * displayName (verified empirically: only author/body/id/parents/
+     * timestamp/type are present), and getConversationMembers returns
+     * lastDisplayed/role/uri without a name field. The real source is
+     * the peer's vCard, surfaced via ConfigurationSignal::ProfileReceived
+     * when the swarm sync replays the vCard commit. The handler is
+     * registered in carrier_register_signals; see on_profile_received. */
+
     /* Discriminate 1:1 vs multi-party. ONE_TO_ONE → TextMessage,
      * everything else → GroupMessage. */
     const std::string mode = resolve_conversation_mode(c, accountId, conversationId);
@@ -408,6 +418,93 @@ void on_reaction_added(Carrier *c,
     copy_fixed(qe.ev.reaction.reaction_id, CARRIER_MESSAGE_ID_LEN, rid);
     copy_fixed(qe.ev.reaction.contact_uri, CARRIER_URI_LEN, author);
     copy_fixed(qe.ev.reaction.text, CARRIER_REACTION_LEN, body);
+    carrier_push_event(c, std::move(qe));
+}
+
+/* ---------------------------------------------------------------------------
+ * ProfileReceived handler
+ *
+ * Fires when a peer's vCard arrives — typically during the initial Swarm
+ * trust-handshake replay (the vCard commit is one of the first commits
+ * shipped over the Swarm git-DAG) and on every subsequent vCard update
+ * the peer publishes via `libjami::updateProfile`. The vcard payload is
+ * the raw text/vcard body; the only field we surface today is `FN:` (the
+ * peer's chosen display name, equivalent to Account.displayName on the
+ * sender's side). Dedup against the per-account contact_names cache so
+ * a re-sync of an unchanged vCard doesn't spam the script with redundant
+ * ContactName events.
+ * ---------------------------------------------------------------------------*/
+
+void on_profile_received(Carrier *c,
+                         const std::string &accountId,
+                         const std::string &from,
+                         const std::string &vcardPath)
+{
+    /* libjami's ProfileReceived signal passes the on-disk path of the
+     * cached vCard (not its content) — empirically verified: the third
+     * argument is the absolute path under <data-dir>/jami/<accountId>/
+     * profiles/<base64-uri>.vcf. Read it here so the rest of the handler
+     * can extract `FN:` from the actual vCard body. */
+    std::string vcard;
+    if (FILE *f = std::fopen(vcardPath.c_str(), "rb")) {
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+            vcard.append(buf, n);
+        }
+        std::fclose(f);
+    }
+    if (vcard.empty()) {
+        CLOG_DEBUG(c, "profile",
+                   "ProfileReceived: empty/missing vCard at path=%s from=%s",
+                   vcardPath.c_str(), from.c_str());
+        return;
+    }
+
+    /* Extract the FN: line from the vCard. vCards use CRLF or LF line
+     * endings; we accept both. Folded continuation lines (RFC 6350 §3.2,
+     * leading whitespace) are uncommon for FN — skip support unless a
+     * real-world vCard triggers a bug. */
+    std::string display_name;
+    {
+        size_t pos = 0;
+        const std::string needle = "FN:";
+        while (pos < vcard.size()) {
+            size_t eol = vcard.find_first_of("\r\n", pos);
+            if (eol == std::string::npos) eol = vcard.size();
+            std::string line = vcard.substr(pos, eol - pos);
+            if (line.compare(0, needle.size(), needle) == 0) {
+                display_name = line.substr(needle.size());
+                break;
+            }
+            pos = (eol < vcard.size() && vcard[eol] == '\r' &&
+                   eol + 1 < vcard.size() && vcard[eol + 1] == '\n')
+                      ? eol + 2
+                      : eol + 1;
+        }
+    }
+    if (display_name.empty()) return;
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        auto it = c->accounts.find(accountId);
+        if (it != c->accounts.end()) {
+            auto &cache = it->second.contact_names;
+            auto cit = cache.find(from);
+            if (cit == cache.end() || cit->second != display_name) {
+                cache[from] = display_name;
+                changed = true;
+            }
+        }
+    }
+    if (!changed) return;
+
+    QueuedEvent qe;
+    stamp(qe.ev, CARRIER_EVENT_CONTACT_NAME);
+    set_account(qe.ev, accountId);
+    copy_fixed(qe.ev.contact_name.contact_uri, CARRIER_URI_LEN, from);
+    copy_fixed(qe.ev.contact_name.display_name, CARRIER_NAME_LEN, display_name);
     carrier_push_event(c, std::move(qe));
 }
 
@@ -921,6 +1018,12 @@ void carrier_register_signals(Carrier *c)
         [c](const std::string &accountId, const std::string &buddyUri,
             int status, const std::string &lineStatus) {
             on_presence_changed(c, accountId, buddyUri, status, lineStatus);
+        }));
+
+    handlers.insert(exportable_callback<CS::ProfileReceived>(
+        [c](const std::string &accountId, const std::string &from,
+            const std::string &vcard) {
+            on_profile_received(c, accountId, from, vcard);
         }));
 
     handlers.insert(exportable_callback<DTS::DataTransferEvent>(
