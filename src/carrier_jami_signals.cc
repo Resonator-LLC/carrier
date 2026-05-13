@@ -12,6 +12,7 @@
 #include "carrier_events.h"
 #include "carrier_internal.hpp"
 #include "carrier_log.h"
+#include "vcard_utils.hpp"
 
 #include <jami/jami.h>
 #include <jami/configurationmanager_interface.h>
@@ -20,6 +21,7 @@
 #include <jami/presencemanager_interface.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -48,6 +50,16 @@ void stamp(CarrierEvent &ev, CarrierEventType type)
     ev.type = type;
     ev.timestamp = carrier_now_ms();
 }
+
+using carrier_vcard::base64_encode;
+using carrier_vcard::extract_vcard_fn;
+using carrier_vcard::slurp_file;
+using carrier_vcard::vcard_path_for_peer;
+
+/* Forward decl: replay sits below on_registration_state (it's a sibling of
+ * on_profile_received), but on_registration_state needs to call it to plug
+ * the silent-libjami-restart gap. */
+void replay_contact_names(Carrier *c, const std::string &accountId);
 
 /* ---------------------------------------------------------------------------
  * Handler bodies
@@ -140,6 +152,14 @@ void on_registration_state(Carrier *c,
                        CARRIER_CONVERSATION_ID_LEN, conv_id);
             carrier_push_event(c, std::move(cev));
         }
+
+        /* Synthetic ContactName for each trusted contact whose vCard is on
+         * disk. libjami's ProfileReceived only fires for NEW vCard commits
+         * arriving via Swarm sync; on a restart against an already-synced
+         * Swarm the signal stays silent. Without this replay, consumers
+         * gating on carrier:ContactName never learn the peer's displayName
+         * and render the bare URI instead. See ISSUE-103. */
+        replay_contact_names(c, accountId);
         return;
     }
 
@@ -445,15 +465,7 @@ void on_profile_received(Carrier *c,
      * argument is the absolute path under <data-dir>/jami/<accountId>/
      * profiles/<base64-uri>.vcf. Read it here so the rest of the handler
      * can extract `FN:` from the actual vCard body. */
-    std::string vcard;
-    if (FILE *f = std::fopen(vcardPath.c_str(), "rb")) {
-        char buf[4096];
-        size_t n;
-        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
-            vcard.append(buf, n);
-        }
-        std::fclose(f);
-    }
+    const std::string vcard = slurp_file(vcardPath);
     if (vcard.empty()) {
         CLOG_DEBUG(c, "profile",
                    "ProfileReceived: empty/missing vCard at path=%s from=%s",
@@ -461,28 +473,7 @@ void on_profile_received(Carrier *c,
         return;
     }
 
-    /* Extract the FN: line from the vCard. vCards use CRLF or LF line
-     * endings; we accept both. Folded continuation lines (RFC 6350 §3.2,
-     * leading whitespace) are uncommon for FN — skip support unless a
-     * real-world vCard triggers a bug. */
-    std::string display_name;
-    {
-        size_t pos = 0;
-        const std::string needle = "FN:";
-        while (pos < vcard.size()) {
-            size_t eol = vcard.find_first_of("\r\n", pos);
-            if (eol == std::string::npos) eol = vcard.size();
-            std::string line = vcard.substr(pos, eol - pos);
-            if (line.compare(0, needle.size(), needle) == 0) {
-                display_name = line.substr(needle.size());
-                break;
-            }
-            pos = (eol < vcard.size() && vcard[eol] == '\r' &&
-                   eol + 1 < vcard.size() && vcard[eol + 1] == '\n')
-                      ? eol + 2
-                      : eol + 1;
-        }
-    }
+    const std::string display_name = extract_vcard_fn(vcard);
     if (display_name.empty()) return;
 
     bool changed = false;
@@ -506,6 +497,57 @@ void on_profile_received(Carrier *c,
     copy_fixed(qe.ev.contact_name.contact_uri, CARRIER_URI_LEN, from);
     copy_fixed(qe.ev.contact_name.display_name, CARRIER_NAME_LEN, display_name);
     carrier_push_event(c, std::move(qe));
+}
+
+/* Replay synthetic CARRIER_EVENT_CONTACT_NAME events for every trusted
+ * contact whose vCard is cached on disk. Called from on_registration_state
+ * at AccountReady time to plug the gap left by libjami: its
+ * ConfigurationSignal::ProfileReceived only fires when a NEW vCard commit
+ * arrives via Swarm sync. On a restart against an already-synced Swarm,
+ * libjami stays silent — historical vCard commits aren't replayed, so
+ * consumers gating on carrier:ContactName would never learn the peer's
+ * displayName and would fall back to rendering the bare URI.
+ *
+ * Mirrors the synthetic-ConversationReady replay just above this site:
+ * the carrier owns the cross-restart consistency contract, not libjami. */
+void replay_contact_names(Carrier *c, const std::string &accountId)
+{
+    const auto contacts = libjami::getContacts(accountId);
+    for (const auto &entry : contacts) {
+        auto uit = entry.find("id");
+        if (uit == entry.end() || uit->second.empty()) continue;
+        const std::string &peer_uri = uit->second;
+
+        const std::string vcard_path =
+            vcard_path_for_peer(c->data_dir, accountId, peer_uri);
+        const std::string vcard = slurp_file(vcard_path);
+        if (vcard.empty()) continue;
+
+        const std::string display_name = extract_vcard_fn(vcard);
+        if (display_name.empty()) continue;
+
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(c->accounts_mtx);
+            auto ait = c->accounts.find(accountId);
+            if (ait != c->accounts.end()) {
+                auto &cache = ait->second.contact_names;
+                auto cit = cache.find(peer_uri);
+                if (cit == cache.end() || cit->second != display_name) {
+                    cache[peer_uri] = display_name;
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) continue;
+
+        QueuedEvent qe;
+        stamp(qe.ev, CARRIER_EVENT_CONTACT_NAME);
+        set_account(qe.ev, accountId);
+        copy_fixed(qe.ev.contact_name.contact_uri, CARRIER_URI_LEN, peer_uri);
+        copy_fixed(qe.ev.contact_name.display_name, CARRIER_NAME_LEN, display_name);
+        carrier_push_event(c, std::move(qe));
+    }
 }
 
 void on_account_message_status(Carrier *c,

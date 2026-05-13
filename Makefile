@@ -249,10 +249,45 @@ $(BUILD_DIR)/serd_%.o: $(SERD_SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-# --- Tests (rewritten for v2 in a later task) ---
-test:
-	@echo "Tests need rewrite for Jami-backed carrier; see arch/jami-migration.md M2/M3."
-	@exit 1
+# --- Tests ---
+#
+# Pure-C/C++ unit tests for helpers that don't pull in libjami. Each test
+# source compiles with the matching compiler (C or C++), then the linker
+# stitches them together — the same convention the main library uses.
+# The libjami-binding side (carrier_jami*.cc) is covered by
+# tests/two_peers.py, which spawns carrier-cli processes.
+#
+# test_turtle_emit.c is intentionally NOT listed: it predates the Jami
+# migration and references the retired CarrierEvent shape. A v2 rewrite
+# is its own follow-up; the current tests cover rdf_canon + vcard_utils,
+# the surfaces touched by ISSUE-103 and ISSUE-104.
+
+TEST_DIR        = tests
+TEST_C_SRC      = test_main.c test_rdf_canon.c
+TEST_CXX_SRC    = test_vcard_utils.cc
+TEST_C_OBJ      = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_C_SRC:.c=.o))
+TEST_CXX_OBJ    = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_CXX_SRC:.cc=.o))
+TEST_SUPPORT    = $(BUILD_DIR)/rdf_canon.o $(SERD_OBJ)
+
+.PHONY: test
+test: $(BUILD_DIR)/carrier-tests
+	@echo "  RUN   carrier-tests"
+	@$(BUILD_DIR)/carrier-tests
+
+$(BUILD_DIR)/carrier-tests: $(TEST_C_OBJ) $(TEST_CXX_OBJ) $(TEST_SUPPORT) | $(BUILD_DIR)
+	@echo "  LD    $(@F)"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)/$(TEST_DIR)
+	@echo "  CC    $(<F)"
+	@$(CC) $(CFLAGS) -I$(TEST_DIR) -c -o $@ $<
+
+$(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.cc | $(BUILD_DIR)/$(TEST_DIR)
+	@echo "  CXX   $(<F)"
+	@$(CXX) $(CXXFLAGS) -I$(TEST_DIR) -c -o $@ $<
+
+$(BUILD_DIR)/$(TEST_DIR):
+	@mkdir -p $@
 
 # --- Sanitizers ---
 asan: clean

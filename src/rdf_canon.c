@@ -13,6 +13,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* No-op error sink installed on every SerdReader we create. Suppresses
+ * serd's default `error: (string):L:C: …` stderr emission for callers that
+ * deliberately feed non-Turtle text (e.g. carrier_send_message hashing a
+ * chat body as best-effort). The reader still returns the appropriate
+ * SerdStatus, which propagates through rdf_canon_hash as -1. */
+static SerdStatus canon_silent_error_sink(void *handle, const SerdError *err)
+{
+    (void)handle;
+    (void)err;
+    return SERD_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------------
  * Dynamic string buffer
  * ---------------------------------------------------------------------------*/
@@ -262,6 +274,13 @@ int rdf_canon_hash(const char *turtle, size_t len, uint8_t out[32])
         serd_env_free(ctx.env);
         return -1;
     }
+
+    /* Silence serd's default GCC-style error printer. Callers already
+     * observe parse failures via the -1 return; the stderr emission was
+     * leaking through carrier_send_message every time a plain-text chat
+     * body got hashed (the embedder treats the result as best-effort and
+     * tolerates -1). See ISSUE-104. */
+    serd_reader_set_error_sink(reader, canon_silent_error_sink, NULL);
 
     SerdStatus st = serd_reader_read_string(reader, (const uint8_t *)turtle);
     serd_reader_free(reader);
