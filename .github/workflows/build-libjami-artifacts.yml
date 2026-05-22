@@ -57,13 +57,30 @@ jobs:
       matrix:
         include:
           - runner: macos-14         # arm64
+            platform: host
             triple-prefix: arm64-apple-darwin
           - runner: macos-13         # x86_64
+            platform: host
             triple-prefix: x86_64-apple-darwin
           - runner: ubuntu-22.04
+            platform: host
             triple-prefix: x86_64-linux-gnu
           - runner: ubuntu-24.04
+            platform: host
             triple-prefix: x86_64-linux-gnu
+          # iOS slices cross-compile on the macos-14 runner via xcrun. Per
+          # build-libjami.sh, the device slice produces a single arm64 prefix
+          # under `<sha>-ios-device-arm64/`; the simulator slice builds arm64
+          # + x86_64 and lipo-merges into `<sha>-ios-sim-fat/`. Tarball cache
+          # is shared with the host macOS entries — upstream archives are
+          # content-addressed, so a gnutls source fetched for the host arm64
+          # build warms the iOS contrib steps on the same runner.
+          - runner: macos-14         # iOS device (arm64)
+            platform: ios-device
+            triple-prefix: ios-device-arm64
+          - runner: macos-14         # iOS simulator (arm64 + x86_64 fat)
+            platform: ios-simulator
+            triple-prefix: ios-sim-fat
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -114,12 +131,12 @@ jobs:
 
       - name: Build libjami
         run: |
-          ./tools/build-libjami.sh
+          ./tools/build-libjami.sh --platform=${{ matrix.platform }}
 
       - name: Determine artifact name
         id: artifact
         run: |
-          PREFIX=$(./tools/build-libjami.sh --print-prefix)
+          PREFIX=$(./tools/build-libjami.sh --print-prefix --platform=${{ matrix.platform }})
           # Use the artifact_triple (kernel-stripped on macOS) so a single
           # tarball serves consumers across macOS kernel versions.
           TRIPLE=$(awk -F= '/^artifact_triple=/{print $2}' "$PREFIX/MANIFEST")

@@ -8,7 +8,13 @@ PREFIX ?= /usr/local
 # libjami prefix
 #
 # libjami is consumed as a pre-built static prefix at $(JAMI_PREFIX), which
-# defaults to ${XDG_CACHE_HOME:-$HOME/.cache}/resonator/libjami/<sha>/ where
+# defaults to ${XDG_CACHE_HOME:-$HOME/.cache}/resonator/libjami/<key>/ where
+# <key> selects host vs iOS slice:
+#
+#   host:                 <sha>/
+#   ios-device:           <sha>-ios-device-arm64/
+#   ios-simulator:        <sha>-ios-sim-fat/
+#
 # <sha> is the line read from JAMI_VERSION. The prefix is laid out as:
 #
 #   $(JAMI_PREFIX)/lib/libjami-core.a   — the core library
@@ -16,21 +22,39 @@ PREFIX ?= /usr/local
 #   $(JAMI_PREFIX)/include/jami/*.h     — public headers
 #
 # Populate the prefix one of three ways:
-#   make libjami         — fetch pre-built tarball; fall back to source build
-#                          (recommended; ~30s when an artifact is published)
-#   make libjami-fetch   — download a pre-built tarball only (no fallback)
-#   make libjami-build   — clone jami-daemon at the pinned SHA outside the
-#                          repo, build hermetically, stage into the cache
-#                          (cold build: 1-3 hours)
+#   make libjami                          — fetch pre-built tarball; fall back
+#                                           to source build (recommended; ~30s
+#                                           when an artifact is published)
+#   make libjami-fetch                    — download a pre-built tarball only
+#                                           (no fallback)
+#   make libjami-build                    — clone jami-daemon at the pinned SHA
+#                                           outside the repo, build
+#                                           hermetically, stage into the cache
+#                                           (cold build: 1-3 hours)
+#
+# Override the platform via the PLATFORM variable (default `host`):
+#   make libjami PLATFORM=ios-device      — iPhone arm64 slice
+#   make libjami PLATFORM=ios-simulator   — Simulator arm64+x86_64 (fat)
 #
 # Pre-built tarballs are produced by .github/workflows/build-libjami-artifacts.yml
 # whenever JAMI_VERSION changes on main; see arch/jami-migration.md D21 for the
 # overall design rationale.
 # ---------------------------------------------------------------------------
 
+PLATFORM ?= host
+
+# JAMI_SUFFIX maps the platform onto the cache-key suffix shared with
+# tools/{build,fetch}-libjami.sh. Host: empty (prefix = <sha>). iOS: a
+# platform-specific suffix appended to <sha>. `$(error ...)` inside a $(if)
+# fires when the recipe is evaluated, so an unknown PLATFORM fails fast.
+JAMI_SUFFIX := $(if $(filter host,$(PLATFORM)),,\
+               $(if $(filter ios-device,$(PLATFORM)),-ios-device-arm64,\
+               $(if $(filter ios-simulator,$(PLATFORM)),-ios-sim-fat,\
+               $(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator)))))
+
 JAMI_SHA          := $(shell tr -d '[:space:]' < JAMI_VERSION 2>/dev/null)
 XDG_CACHE_HOME    ?= $(HOME)/.cache
-JAMI_PREFIX       ?= $(XDG_CACHE_HOME)/resonator/libjami/$(JAMI_SHA)
+JAMI_PREFIX       ?= $(XDG_CACHE_HOME)/resonator/libjami/$(JAMI_SHA)$(JAMI_SUFFIX)
 JAMI_INC          = $(JAMI_PREFIX)/include
 JAMI_LIB          = $(JAMI_PREFIX)/lib/libjami-core.a
 JAMI_CONTRIB_LIB  = $(JAMI_PREFIX)/lib
@@ -191,7 +215,18 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
+# `make all` builds carrier-cli, which is host-only — the link flags below
+# target Darwin/Linux, not iOS. Calling `make all PLATFORM=ios-*` would
+# resolve JAMI_LIB to the iOS prefix and then attempt a host link against
+# iOS .a archives, which fails confusingly. Gate it here for a clear error.
 check-libjami:
+	@if [ "$(PLATFORM)" != "host" ]; then \
+	    echo "ERROR: 'make all' / check-libjami is host-only (got PLATFORM=$(PLATFORM))."; \
+	    echo "       For iOS prefixes, use:"; \
+	    echo "         make libjami PLATFORM=ios-device     # iPhone arm64"; \
+	    echo "         make libjami PLATFORM=ios-simulator  # Simulator fat"; \
+	    exit 1; \
+	fi
 	@if [ -z "$(JAMI_SHA)" ]; then \
 	    echo "ERROR: JAMI_VERSION is missing or empty (expected at $(CURDIR)/JAMI_VERSION)"; \
 	    exit 1; \
@@ -209,17 +244,17 @@ check-libjami:
 	fi
 
 libjami:
-	@if ! tools/fetch-libjami.sh; then \
+	@if ! tools/fetch-libjami.sh --platform=$(PLATFORM); then \
 	    echo ""; \
 	    echo "==> Fetch failed; falling back to source build."; \
-	    tools/build-libjami.sh; \
+	    tools/build-libjami.sh --platform=$(PLATFORM); \
 	fi
 
 libjami-build:
-	@tools/build-libjami.sh
+	@tools/build-libjami.sh --platform=$(PLATFORM)
 
 libjami-fetch:
-	@tools/fetch-libjami.sh
+	@tools/fetch-libjami.sh --platform=$(PLATFORM)
 
 deps: libjami
 
