@@ -249,15 +249,31 @@ build_one_arch_ios() {
 
     # Cross-compile hygiene: GNU autoconf packages (gmp, gnutls, …) probe for
     # a "build system compiler" that can produce binaries runnable on the
-    # build host (used for codegen helpers during cross-compile). With the
-    # iOS CC/CFLAGS above leaking through, the probe loop tries every
-    # candidate compiler with iOS flags appended and fails with
-    #   configure: error: Cannot find a build system compiler
-    # Setting CC_FOR_BUILD / *_FOR_BUILD to neutral host-only values gives
-    # configure the right compiler for the build-host helpers.
-    export CC_FOR_BUILD="/usr/bin/cc"
-    export CXX_FOR_BUILD="/usr/bin/c++"
-    export CPP_FOR_BUILD="/usr/bin/cc -E"
+    # build host (used for codegen helpers during cross-compile). Two leaks
+    # have to be plugged for the probe to succeed.
+    #
+    # 1. iOS CFLAGS in `$CFLAGS` are NOT consumed by the probe (it ignores
+    #    autoconf CFLAGS and uses a bare `$CC_FOR_BUILD conftest.c -o
+    #    conftest` command), so the bare `cc/gcc` candidates would normally
+    #    compile cleanly — except for...
+    # 2. `$SDKROOT` is honored by clang as a fallback for `-isysroot`. We
+    #    exported it above pointing at iPhoneSimulator.sdk / iPhoneOS.sdk
+    #    so `xcrun` finds the right SDK for the iOS CC. A bare `/usr/bin/cc`
+    #    invocation then inherits SDKROOT, produces a Mach-O with
+    #    LC_BUILD_VERSION platform=IOSSIMULATOR, and macOS dyld refuses to
+    #    exec it. GMP's probe runs the compiled conftest, so the run fails
+    #    and GMP reports either "Cannot find a build system compiler"
+    #    (no explicit CC_FOR_BUILD) or "Specified CC_FOR_BUILD doesn't
+    #    seem to work" (explicit /usr/bin/cc).
+    #
+    # Fix: set CC_FOR_BUILD with an explicit `-isysroot` to the macOSX SDK.
+    # The command-line `-isysroot` overrides the SDKROOT env, so the build-
+    # host compiler emits a macOS Mach-O that dyld will run.
+    local macos_sdk
+    macos_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+    export CC_FOR_BUILD="/usr/bin/cc -isysroot $macos_sdk"
+    export CXX_FOR_BUILD="/usr/bin/c++ -isysroot $macos_sdk"
+    export CPP_FOR_BUILD="/usr/bin/cc -isysroot $macos_sdk -E"
     export CFLAGS_FOR_BUILD=""
     export CXXFLAGS_FOR_BUILD=""
     export CPPFLAGS_FOR_BUILD=""
