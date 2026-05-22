@@ -45,12 +45,29 @@ PLATFORM ?= host
 
 # JAMI_SUFFIX maps the platform onto the cache-key suffix shared with
 # tools/{build,fetch}-libjami.sh. Host: empty (prefix = <sha>). iOS: a
-# platform-specific suffix appended to <sha>. `$(error ...)` inside a $(if)
-# fires when the recipe is evaluated, so an unknown PLATFORM fails fast.
-JAMI_SUFFIX := $(if $(filter host,$(PLATFORM)),,\
-               $(if $(filter ios-device,$(PLATFORM)),-ios-device-arm64,\
-               $(if $(filter ios-simulator,$(PLATFORM)),-ios-sim-fat,\
-               $(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator)))))
+# platform-specific suffix appended to <sha>. An unknown PLATFORM hits the
+# `$(error ...)` at parse time.
+#
+# ios-sim-arm64 / ios-sim-x86_64 are internal single-arch values used by the
+# `libcarrier-ios PLATFORM=ios-simulator` recursive build. They share the
+# fat libjami prefix (libjami's sim slice is published lipo'd; our carrier
+# slice is lipo'd at the end too). End users specify ios-simulator.
+#
+# `ifeq` blocks (rather than nested `$(if ...)`) avoid the whitespace-leak
+# trap where continuation-line indentation gets baked into the suffix value.
+ifeq ($(PLATFORM),host)
+JAMI_SUFFIX :=
+else ifeq ($(PLATFORM),ios-device)
+JAMI_SUFFIX := -ios-device-arm64
+else ifeq ($(PLATFORM),ios-simulator)
+JAMI_SUFFIX := -ios-sim-fat
+else ifeq ($(PLATFORM),ios-sim-arm64)
+JAMI_SUFFIX := -ios-sim-fat
+else ifeq ($(PLATFORM),ios-sim-x86_64)
+JAMI_SUFFIX := -ios-sim-fat
+else
+$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator))
+endif
 
 JAMI_SHA          := $(shell tr -d '[:space:]' < JAMI_VERSION 2>/dev/null)
 XDG_CACHE_HOME    ?= $(HOME)/.cache
@@ -79,8 +96,25 @@ SERD_INC     = $(SERD_DIR)/include
 SERD_SRC_DIR = $(SERD_DIR)/src
 
 SRC_DIR   = src
-BUILD_DIR = build
 INC_DIR   = include
+
+# BUILD_DIR is platform-suffixed so iOS objects don't clobber host ones —
+# `make all` (host) keeps the historical `build/` path, and each iOS slice
+# gets its own dir. The ios-simulator fat dir is produced by lipo'ing the
+# two single-arch dirs (see the libcarrier-ios target below).
+ifeq ($(PLATFORM),host)
+BUILD_DIR := build
+else ifeq ($(PLATFORM),ios-device)
+BUILD_DIR := build-ios-device-arm64
+else ifeq ($(PLATFORM),ios-simulator)
+BUILD_DIR := build-ios-sim-fat
+else ifeq ($(PLATFORM),ios-sim-arm64)
+BUILD_DIR := build-ios-sim-arm64
+else ifeq ($(PLATFORM),ios-sim-x86_64)
+BUILD_DIR := build-ios-sim-x86_64
+else
+$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator))
+endif
 
 # ---------------------------------------------------------------------------
 # Compile flags
@@ -89,11 +123,50 @@ INC_DIR   = include
 COMMON_WARN = -Wall -Wextra -Wno-unused-parameter -Wno-nullability-extension
 COMMON_INC  = -I$(INC_DIR) -I$(SRC_DIR) -I$(JAMI_INC) -I$(SERD_INC)
 
+# iOS cross-compile: override CC/CXX/AR to xcrun-driven clang and inject
+# the right arch + sysroot + version-min flags. Bitcode is on for device
+# (Jami's own contribs build with -fembed-bitcode), off for simulator.
+# The 'ios-simulator' composite platform doesn't compile directly — it
+# drives recursive ios-sim-arm64 / ios-sim-x86_64 builds and lipos the
+# resulting archives (see libcarrier-ios target).
+ifneq ($(filter ios-device ios-sim-arm64 ios-sim-x86_64,$(PLATFORM)),)
+ifeq ($(PLATFORM),ios-device)
+IOS_SDK   := iphoneos
+IOS_ARCH  := arm64
+IOS_MIN   := -miphoneos-version-min=14.5
+IOS_BC    := -fembed-bitcode
+else ifeq ($(PLATFORM),ios-sim-arm64)
+IOS_SDK   := iphonesimulator
+IOS_ARCH  := arm64
+IOS_MIN   := -mios-simulator-version-min=14.5
+IOS_BC    :=
+else
+IOS_SDK   := iphonesimulator
+IOS_ARCH  := x86_64
+IOS_MIN   := -mios-simulator-version-min=14.5
+IOS_BC    :=
+endif
+IOS_SDKROOT := $(shell xcrun --sdk $(IOS_SDK) --show-sdk-path)
+IOS_FLAGS   := $(IOS_MIN) $(IOS_BC) -arch $(IOS_ARCH) -isysroot $(IOS_SDKROOT)
+
+CC  := xcrun -sdk $(IOS_SDK) clang
+CXX := xcrun -sdk $(IOS_SDK) clang++
+AR  := xcrun -sdk $(IOS_SDK) ar
+endif
+
 CFLAGS   ?= -std=c11 -D_DEFAULT_SOURCE $(COMMON_WARN)
 CFLAGS   += $(COMMON_INC) -DSERD_STATIC
 
 CXXFLAGS ?= -std=c++20 $(COMMON_WARN)
 CXXFLAGS += $(COMMON_INC)
+
+# Append iOS arch/sdk/min-version flags to every compile command. Done as a
+# separate `+=` after the host defaults so users can still override CFLAGS
+# from the environment for host builds without losing the iOS injection.
+ifneq ($(filter ios-device ios-sim-arm64 ios-sim-x86_64,$(PLATFORM)),)
+CFLAGS   += $(IOS_FLAGS)
+CXXFLAGS += $(IOS_FLAGS)
+endif
 
 # ---------------------------------------------------------------------------
 # Link flags
@@ -194,6 +267,9 @@ SERD_SRC = base64.c byte_source.c env.c n3.c node.c read_utf8.c reader.c \
            string.c system.c uri.c writer.c
 SERD_OBJ = $(addprefix $(BUILD_DIR)/serd_, $(SERD_SRC:.c=.o))
 SERD_CFLAGS = -std=c11 -w -I$(SERD_INC) -I$(SERD_SRC_DIR) -DSERD_STATIC
+ifneq ($(filter ios-device ios-sim-arm64 ios-sim-x86_64,$(PLATFORM)),)
+SERD_CFLAGS += $(IOS_FLAGS)
+endif
 
 # Library sources — mix of C++ (shim + internals that touch C++ state) and C.
 LIB_CXX_SRC = carrier_jami.cc carrier_jami_signals.cc carrier_events.cc carrier_log.cc
@@ -211,9 +287,45 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps libjami libjami-build libjami-fetch
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami libjami-build libjami-fetch libcarrier-ios
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
+
+# Cross-compile libcarrier.a for an iOS slice. Library-only — no carrier-cli,
+# because the CLI links libjami + system frameworks and that link is host-
+# specific (Darwin/Linux LDFLAGS in this Makefile). The .a is just an archive
+# of carrier object files + serd objects; the antenna staticlib pulls them in
+# and the final link happens in Xcode against per-slice libjami contribs.
+#
+# PLATFORM=ios-device     -> build-ios-device-arm64/libcarrier.a (arm64)
+# PLATFORM=ios-simulator  -> build-ios-sim-fat/libcarrier.a (arm64 + x86_64 lipo'd)
+#
+# Headers are required ($(JAMI_INC) must exist; the C++ sources include
+# <jami/*.h>) but the .a archives in $(JAMI_LIB) are not — no linking happens.
+libcarrier-ios:
+ifeq ($(PLATFORM),ios-device)
+	@if [ ! -d "$(JAMI_INC)/jami" ]; then \
+	    echo "ERROR: iOS libjami headers not found at $(JAMI_INC)/jami"; \
+	    echo "       Run: make libjami PLATFORM=ios-device"; \
+	    exit 1; \
+	fi
+	@$(MAKE) PLATFORM=ios-device $(BUILD_DIR)/libcarrier.a
+else ifeq ($(PLATFORM),ios-simulator)
+	@if [ ! -d "$(JAMI_INC)/jami" ]; then \
+	    echo "ERROR: iOS libjami headers not found at $(JAMI_INC)/jami"; \
+	    echo "       Run: make libjami PLATFORM=ios-simulator"; \
+	    exit 1; \
+	fi
+	@$(MAKE) PLATFORM=ios-sim-arm64  build-ios-sim-arm64/libcarrier.a
+	@$(MAKE) PLATFORM=ios-sim-x86_64 build-ios-sim-x86_64/libcarrier.a
+	@mkdir -p build-ios-sim-fat
+	@echo "  LIPO  build-ios-sim-fat/libcarrier.a"
+	@lipo -create build-ios-sim-arm64/libcarrier.a build-ios-sim-x86_64/libcarrier.a \
+	    -output build-ios-sim-fat/libcarrier.a
+else
+	@echo "ERROR: libcarrier-ios requires PLATFORM=ios-device|ios-simulator (got $(PLATFORM))" >&2
+	@exit 1
+endif
 
 # `make all` builds carrier-cli, which is host-only — the link flags below
 # target Darwin/Linux, not iOS. Calling `make all PLATFORM=ios-*` would

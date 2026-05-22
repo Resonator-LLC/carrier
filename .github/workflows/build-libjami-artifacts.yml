@@ -62,9 +62,9 @@ jobs:
           - runner: macos-13         # x86_64
             platform: host
             triple-prefix: x86_64-apple-darwin
-          - runner: ubuntu-22.04
-            platform: host
-            triple-prefix: x86_64-linux-gnu
+          # ubuntu-24.04 is the only Linux entry. ubuntu-22.04 was dropped
+          # because both runners produced the same `x86_64-linux-gnu` triple
+          # and clobbered each other's release asset upload.
           - runner: ubuntu-24.04
             platform: host
             triple-prefix: x86_64-linux-gnu

@@ -247,6 +247,22 @@ build_one_arch_ios() {
     export CXXFLAGS="$min_flag $bitcode -arch $arch -isysroot $sdkroot"
     export LDFLAGS="$min_flag $bitcode -arch $arch -isysroot $sdkroot"
 
+    # Cross-compile hygiene: GNU autoconf packages (gmp, gnutls, …) probe for
+    # a "build system compiler" that can produce binaries runnable on the
+    # build host (used for codegen helpers during cross-compile). With the
+    # iOS CC/CFLAGS above leaking through, the probe loop tries every
+    # candidate compiler with iOS flags appended and fails with
+    #   configure: error: Cannot find a build system compiler
+    # Setting CC_FOR_BUILD / *_FOR_BUILD to neutral host-only values gives
+    # configure the right compiler for the build-host helpers.
+    export CC_FOR_BUILD="/usr/bin/cc"
+    export CXX_FOR_BUILD="/usr/bin/c++"
+    export CPP_FOR_BUILD="/usr/bin/cc -E"
+    export CFLAGS_FOR_BUILD=""
+    export CXXFLAGS_FOR_BUILD=""
+    export CPPFLAGS_FOR_BUILD=""
+    export LDFLAGS_FOR_BUILD=""
+
     # Idempotent: bootstrap rewrites config.mak; make's stamp files cache
     # built packages.
     ../bootstrap \
