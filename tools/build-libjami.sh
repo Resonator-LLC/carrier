@@ -41,7 +41,11 @@ TARBALL_CACHE="$CACHE_ROOT/libjami-tarballs"
 # iOS deployment floor — matches Jami's own CI (jami-client-ios/compile-ios.sh).
 # Bumping requires checking that libjami's contribs build clean against the
 # chosen SDK.
-MIN_IOS_VERSION=14.5
+#
+# Exported so Jami's contrib/src/main.mak picks it up (its default is 9.3,
+# which makes std::filesystem::path unavailable in C++17/20 contribs like
+# dhtnet — they need iOS 13.0+ for filesystem).
+export MIN_IOS_VERSION=14.5
 
 # --- arg parsing ------------------------------------------------------------
 
