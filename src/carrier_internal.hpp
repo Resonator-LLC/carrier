@@ -16,6 +16,7 @@
 
 #include "carrier.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -127,6 +128,13 @@ struct Carrier
     /* --- Accounts ------------------------------------------------------- */
 
     std::mutex                                  accounts_mtx;
+    /* Notified whenever any account's `registered` flag flips. Lets
+     * carrier_create_account block until the freshly-minted account's
+     * RegistrationStateChanged → REGISTERED signal fires — at that point
+     * libjami has populated JamiAccount::accountManager_, so the next
+     * Antenna pipeline emit (carrier:SetNick → libjami::updateProfile)
+     * won't null-deref. Race observed on iOS sim, latent everywhere. */
+    std::condition_variable                     accounts_cv;
     std::unordered_map<std::string, AccountState> accounts;
 
     /* --- libjami init state --------------------------------------------- */

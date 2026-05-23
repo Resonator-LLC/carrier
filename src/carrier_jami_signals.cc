@@ -18,6 +18,13 @@
 #include <jami/configurationmanager_interface.h>
 #include <jami/conversation_interface.h>
 #include <jami/datatransfer_interface.h>
+
+// TARGET_OS_IOS / TARGET_OS_IPHONE come from Apple's TargetConditionals.
+// Required to gate the GetAppDataPath signal handler that iOS demands —
+// see carrier_register_signals below. Linux + macOS define neither.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <jami/presencemanager_interface.h>
 
 #include <cstdint>
@@ -75,24 +82,22 @@ void on_registration_state(Carrier *c,
                            int /*code*/,
                            const std::string &detailsStr)
 {
-    /* Maintain the per-account registered flag. */
+    /* Maintain the per-account registered flag. Use operator[] (lazy-
+     * insert) instead of find() so the signal isn't lost if it arrives
+     * BEFORE carrier_create_account had a chance to populate the entry —
+     * which it does, since carrier_create_account now blocks on
+     * accounts_cv until `registered` flips. */
     bool first_registered = false;
     {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);
-        auto it = c->accounts.find(accountId);
-        if (it != c->accounts.end()) {
-            const bool now_registered = (state == "REGISTERED");
-            if (now_registered && !it->second.registered) {
-                first_registered = true;
-            }
-            it->second.registered = now_registered;
-            if (now_registered) {
-                /* Resolve self_uri lazily — fetched by carrier_jami.cc
-                 * via getAccountDetails when AccountReady is about to
-                 * fire. Kept here as an empty string. */
-            }
+        auto &st = c->accounts[accountId];
+        const bool now_registered = (state == "REGISTERED");
+        if (now_registered && !st.registered) {
+            first_registered = true;
         }
+        st.registered = now_registered;
     }
+    c->accounts_cv.notify_all();
 
     QueuedEvent qe;
     if (first_registered) {
@@ -1098,6 +1103,39 @@ void carrier_register_signals(Carrier *c)
         [c](const std::string &accountId, const std::string &deviceId, int status) {
             on_device_revocation_ended(c, accountId, deviceId, status);
         }));
+
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+    // GetAppDataPath: iOS (and Android) libjami delegates filesystem-path
+    // resolution to the embedder because the daemon has no idea where the
+    // sandbox container lives. fileutils::get_data_dir / get_config_dir /
+    // get_cache_dir all emit this signal with name="files" | "config" |
+    // "cache". If we don't register a handler, get_data_dir() returns
+    // empty and every "<account_id>/config.yml" lookup goes through a
+    // relative path against the daemon's CWD — YAML::LoadFile throws
+    // `bad file: <id>/config.yml` (observed on iPhone 17 Pro sim in
+    // Cut 8.5).
+    //
+    // We map the three kinds onto `c->data_dir`:
+    //   files  → <data_dir>           (account folders live here)
+    //   config → <data_dir>/config    (libjami's runtime config slot)
+    //   cache  → <data_dir>/cache     (regenerable scratch)
+    handlers.insert(exportable_callback<CS::GetAppDataPath>(
+        [c](const std::string &name, std::vector<std::string> *paths) {
+            if (!c || !paths) return;
+            std::string base = c->data_dir;
+            std::string p;
+            if (name == "files") {
+                p = base;
+            } else if (name == "config") {
+                p = base + "/config";
+            } else if (name == "cache") {
+                p = base + "/cache";
+            } else {
+                p = base + "/" + name;
+            }
+            paths->push_back(std::move(p));
+        }));
+#endif
 
     libjami::registerSignalHandlers(handlers);
 }

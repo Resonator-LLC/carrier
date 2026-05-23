@@ -372,6 +372,36 @@ extern "C" int carrier_create_account(Carrier    *c,
         if (display_name) st.display_name = display_name;
     }
 
+    /* Block until libjami fires RegistrationStateChanged → REGISTERED on
+     * this account. Before that point JamiAccount::accountManager_ is
+     * still null, and any libjami call that derefs it (updateProfile,
+     * sendMessage, getKnownDevices, …) null-derefs. On macOS the
+     * registration is fast enough that pipelines win the race almost
+     * always; on iOS sim the race loses reliably (crash in
+     * jami::JamiAccount::updateProfile observed in Cut 8.5 / 8.6).
+     *
+     * 30 s is the cold-account budget — first-time minting also fetches
+     * an OpenDHT InfoHash and registers with the bootstrap peers. */
+    {
+        std::unique_lock<std::mutex> lock(c->accounts_mtx);
+        const bool ok = c->accounts_cv.wait_for(
+            lock, std::chrono::seconds(30),
+            [&]() {
+                auto it = c->accounts.find(accountId);
+                return it != c->accounts.end() && it->second.registered;
+            });
+        if (!ok) {
+            CLOG_ERROR(c, "SHIM",
+                       "account %s did not register within 30s; the "
+                       "account exists but accountManager_ may not be "
+                       "ready — subsequent libjami calls may null-deref",
+                       accountId.c_str());
+            emit_error(c, accountId, "CreateAccount", "RegistrationTimeout",
+                       "account did not register within 30s");
+            return -1;
+        }
+    }
+
     copy_to(out_account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
     CLOG_INFO(c, "SHIM", "created account %s", accountId.c_str());
     return 0;
@@ -395,13 +425,37 @@ extern "C" int carrier_load_account(Carrier *c, const char *account_id)
         return -1;
     }
 
-    std::lock_guard<std::mutex> lock(c->accounts_mtx);
-    AccountState &st = c->accounts[account_id];
-    if (auto it = details.find("Account.username"); it != details.end()) {
-        st.self_uri = it->second;
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        AccountState &st = c->accounts[account_id];
+        if (auto it = details.find("Account.username"); it != details.end()) {
+            st.self_uri = it->second;
+        }
+        if (auto it = details.find("Account.displayName"); it != details.end()) {
+            st.display_name = it->second;
+        }
     }
-    if (auto it = details.find("Account.displayName"); it != details.end()) {
-        st.display_name = it->second;
+
+    /* Same wait as carrier_create_account: block until libjami fires
+     * REGISTERED, so accountManager_ is non-null by the time we return
+     * and the next pipeline emit (e.g. carrier:SetNick) doesn't race
+     * into a half-initialised JamiAccount. Load-from-disk is typically
+     * faster than fresh mint (no DHT bootstrap), but the race window
+     * still exists. */
+    {
+        std::unique_lock<std::mutex> lock(c->accounts_mtx);
+        const bool ok = c->accounts_cv.wait_for(
+            lock, std::chrono::seconds(30),
+            [&]() {
+                auto it = c->accounts.find(account_id);
+                return it != c->accounts.end() && it->second.registered;
+            });
+        if (!ok) {
+            CLOG_ERROR(c, "SHIM",
+                       "account %s did not register within 30s",
+                       account_id);
+            return -1;
+        }
     }
     return 0;
 }
