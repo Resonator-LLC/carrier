@@ -344,25 +344,62 @@ extern "C" void carrier_set_event_callback(Carrier *c, carrier_event_cb cb, void
  * Accounts
  * ---------------------------------------------------------------------------*/
 
+namespace {
+
+/* Push an ACCOUNT_ERROR event carrying a closed-vocabulary cause token. */
+void emit_account_error(Carrier *c, const std::string &accountId, const char *cause)
+{
+    QueuedEvent qe;
+    qe.ev.type = CARRIER_EVENT_ACCOUNT_ERROR;
+    qe.ev.timestamp = carrier_now_ms();
+    copy_to(qe.ev.account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
+    qe.message_text = cause;
+    qe.ev.account_error.cause = qe.message_text.c_str();
+    carrier_push_event(c, std::move(qe));
+}
+
+} /* anonymous namespace */
+
 extern "C" int carrier_create_account(Carrier    *c,
                                       const char *display_name,
+                                      const char *archive_path_or_null,
+                                      const char *archive_password_or_null,
                                       char        out_account_id[CARRIER_ACCOUNT_ID_LEN])
 {
     if (!c || !out_account_id) return -1;
 
+    const bool importing = (archive_path_or_null && *archive_path_or_null);
+    const char *password = archive_password_or_null ? archive_password_or_null : "";
+
+    /* Pre-validate the archive path so "file not present" doesn't fall
+     * through to libjami's generic failure — the onboarding pipeline
+     * pattern-matches on cause="not-found" to render the correct error. */
+    if (importing && access(archive_path_or_null, R_OK) != 0) {
+        CLOG_ERROR(c, "SHIM", "import archive unreadable: %s (%s)",
+                   archive_path_or_null, std::strerror(errno));
+        emit_account_error(c, "", "not-found");
+        return -1;
+    }
+
     std::map<std::string, std::string> details;
     details["Account.type"] = "RING";
-    details["Account.archiveHasPassword"] = "false";
-    details["Account.archivePassword"] = "";
+    details["Account.archiveHasPassword"] = (password[0] != '\0') ? "true" : "false";
+    details["Account.archivePassword"] = password;
     if (display_name && *display_name) {
         details["Account.alias"] = display_name;
         details["Account.displayName"] = display_name;
     }
+    if (importing) {
+        details["Account.archivePath"] = archive_path_or_null;
+    }
 
     const std::string accountId = libjami::addAccount(details);
     if (accountId.empty()) {
-        emit_error(c, "", "CreateAccount", "LibjamiFailure",
-                   "addAccount returned empty id");
+        CLOG_ERROR(c, "SHIM", "addAccount returned empty id");
+        /* libjami refused to even create the account row. For import this
+         * usually means the archive is unparseable; for fresh-create it's
+         * a libjami internal error. */
+        emit_account_error(c, "", importing ? "corrupted" : "unknown");
         return -1;
     }
 
@@ -381,14 +418,18 @@ extern "C" int carrier_create_account(Carrier    *c,
      * jami::JamiAccount::updateProfile observed in Cut 8.5 / 8.6).
      *
      * 30 s is the cold-account budget — first-time minting also fetches
-     * an OpenDHT InfoHash and registers with the bootstrap peers. */
+     * an OpenDHT InfoHash and registers with the bootstrap peers. The
+     * predicate also wakes on ERROR_* so wrong-pin / corrupted-archive
+     * imports return -1 within seconds instead of after the full wait. */
+    bool errored = false;
     {
         std::unique_lock<std::mutex> lock(c->accounts_mtx);
         const bool ok = c->accounts_cv.wait_for(
             lock, std::chrono::seconds(30),
             [&]() {
                 auto it = c->accounts.find(accountId);
-                return it != c->accounts.end() && it->second.registered;
+                if (it == c->accounts.end()) return false;
+                return it->second.registered || !it->second.error_state.empty();
             });
         if (!ok) {
             CLOG_ERROR(c, "SHIM",
@@ -396,14 +437,21 @@ extern "C" int carrier_create_account(Carrier    *c,
                        "account exists but accountManager_ may not be "
                        "ready — subsequent libjami calls may null-deref",
                        accountId.c_str());
-            emit_error(c, accountId, "CreateAccount", "RegistrationTimeout",
-                       "account did not register within 30s");
+            emit_account_error(c, accountId, "register-timeout");
             return -1;
         }
+        auto it = c->accounts.find(accountId);
+        errored = (it != c->accounts.end() && !it->second.error_state.empty());
+    }
+    if (errored) {
+        /* AccountError was already enqueued by the signal handler with a
+         * translated cause token — don't double-emit. */
+        return -1;
     }
 
     copy_to(out_account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
-    CLOG_INFO(c, "SHIM", "created account %s", accountId.c_str());
+    CLOG_INFO(c, "SHIM", "%s account %s",
+              importing ? "imported" : "created", accountId.c_str());
     return 0;
 }
 
@@ -441,22 +489,90 @@ extern "C" int carrier_load_account(Carrier *c, const char *account_id)
      * and the next pipeline emit (e.g. carrier:SetNick) doesn't race
      * into a half-initialised JamiAccount. Load-from-disk is typically
      * faster than fresh mint (no DHT bootstrap), but the race window
-     * still exists. */
+     * still exists. ERROR_* short-circuits via the same predicate. */
+    bool errored = false;
     {
         std::unique_lock<std::mutex> lock(c->accounts_mtx);
         const bool ok = c->accounts_cv.wait_for(
             lock, std::chrono::seconds(30),
             [&]() {
                 auto it = c->accounts.find(account_id);
-                return it != c->accounts.end() && it->second.registered;
+                if (it == c->accounts.end()) return false;
+                return it->second.registered || !it->second.error_state.empty();
             });
         if (!ok) {
             CLOG_ERROR(c, "SHIM",
                        "account %s did not register within 30s",
                        account_id);
+            emit_account_error(c, account_id, "register-timeout");
+            return -1;
+        }
+        auto it = c->accounts.find(account_id);
+        errored = (it != c->accounts.end() && !it->second.error_state.empty());
+    }
+    if (errored) return -1;
+    return 0;
+}
+
+extern "C" int carrier_export_account(Carrier    *c,
+                                      const char *account_id,
+                                      const char *destination_path,
+                                      const char *password)
+{
+    if (!c || !account_id || !*account_id || !destination_path || !*destination_path) {
+        return -1;
+    }
+
+    /* Reject pre-AccountReady so the onboarding pipeline doesn't surface a
+     * generic libjami false when the user races the export call. */
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        auto it = c->accounts.find(account_id);
+        if (it == c->accounts.end() || !it->second.registered) {
+            CLOG_ERROR(c, "SHIM",
+                       "export_account: %s not ready (registered=%d)",
+                       account_id,
+                       it != c->accounts.end() ? it->second.registered : -1);
+            emit_account_error(c, account_id, "not-ready");
             return -1;
         }
     }
+
+    const std::string pw = password ? password : "";
+    const bool ok = libjami::exportToFile(account_id, destination_path,
+                                          /*scheme=*/"", pw);
+    if (!ok) {
+        CLOG_ERROR(c, "SHIM", "exportToFile(%s -> %s) returned false",
+                   account_id, destination_path);
+        emit_account_error(c, account_id, "write-failed");
+        return -1;
+    }
+
+    QueuedEvent qe;
+    qe.ev.type = CARRIER_EVENT_ACCOUNT_ARCHIVE_READY;
+    qe.ev.timestamp = carrier_now_ms();
+    copy_to(qe.ev.account_id, CARRIER_ACCOUNT_ID_LEN, account_id);
+    copy_to(qe.ev.account_archive_ready.path, CARRIER_PATH_LEN,
+            std::string(destination_path));
+    carrier_push_event(c, std::move(qe));
+
+    CLOG_INFO(c, "SHIM", "exported account %s -> %s",
+              account_id, destination_path);
+    return 0;
+}
+
+extern "C" int carrier_remove_account(Carrier *c, const char *account_id)
+{
+    if (!c || !account_id) return -1;
+
+    libjami::removeAccount(account_id);
+
+    {
+        std::lock_guard<std::mutex> lock(c->accounts_mtx);
+        c->accounts.erase(account_id);
+    }
+
+    CLOG_INFO(c, "SHIM", "removed account %s", account_id);
     return 0;
 }
 

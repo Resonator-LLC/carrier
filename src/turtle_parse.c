@@ -181,12 +181,18 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
 
     /* --- Account lifecycle --- */
 
-    if (strcmp(stmt->type, "CreateAccount") == 0) {
-        const char *name = find_pred(stmt, "displayName");
+    /* CreateAccount and ImportAccount route through the same carrier_create_account
+     * call — the C side branches on archivePath. Two RDF type names exist so the
+     * intent reads cleanly at the call site. */
+    if (strcmp(stmt->type, "CreateAccount") == 0 ||
+        strcmp(stmt->type, "ImportAccount") == 0) {
+        const char *name     = find_pred(stmt, "displayName");
+        const char *path     = find_pred(stmt, "archivePath");
+        const char *password = find_pred(stmt, "archivePassword");
         char new_id[CARRIER_ACCOUNT_ID_LEN];
-        if (carrier_create_account(c, name, new_id) != 0) {
-            carrier_emit_error(c, "CreateAccount", "LibjamiFailure",
-                               "carrier_create_account failed");
+        if (carrier_create_account(c, name, path, password, new_id) != 0) {
+            /* AccountError already enqueued by the C layer with a closed
+             * cause token; no further Error event needed. */
         }
         return 0;
     }
@@ -198,6 +204,27 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
             carrier_emit_error(c, "LoadAccount", "NoSuchAccount",
                                "no account %s", account);
         }
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "ExportAccount") == 0) {
+        const char *account = require_account(c, stmt, "ExportAccount");
+        if (!account) return 0;
+        const char *path     = find_pred(stmt, "path");
+        const char *password = find_pred(stmt, "archivePassword");
+        if (!path || !*path) {
+            carrier_emit_error(c, "ExportAccount", "MissingField",
+                               "ExportAccount requires carrier:path");
+            return 0;
+        }
+        (void) carrier_export_account(c, account, path, password);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "RemoveAccount") == 0) {
+        const char *account = require_account(c, stmt, "RemoveAccount");
+        if (!account) return 0;
+        (void) carrier_remove_account(c, account);
         return 0;
     }
 

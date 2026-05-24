@@ -171,9 +171,29 @@ void on_registration_state(Carrier *c,
     if (state == "ERROR_GENERIC" || state == "ERROR_AUTH" ||
         state == "ERROR_NETWORK" || state == "ERROR_HOST" ||
         state == "ERROR_NEED_MIGRATION") {
+        /* Stash the raw state so accounts_cv waiters
+         * (carrier_create_account, carrier_load_account) can wake
+         * immediately on permanent failure instead of timing out at 30s.
+         * Keep the raw libjami text alive in the SHIM log for debugging;
+         * the user-facing event carries the closed-vocab cause token
+         * mapped below. */
+        {
+            std::lock_guard<std::mutex> lock(c->accounts_mtx);
+            c->accounts[accountId].error_state = state;
+        }
+        c->accounts_cv.notify_all();
+
+        CLOG_WARN(c, "SHIM", "account %s entered %s (%s)",
+                  accountId.c_str(), state.c_str(),
+                  detailsStr.empty() ? "no details" : detailsStr.c_str());
+
+        const char *cause = "unknown";
+        if (state == "ERROR_AUTH")             cause = "wrong-pin";
+        else if (state == "ERROR_NEED_MIGRATION") cause = "corrupted";
+
         stamp(qe.ev, CARRIER_EVENT_ACCOUNT_ERROR);
         set_account(qe.ev, accountId);
-        qe.message_text = detailsStr.empty() ? state : detailsStr;
+        qe.message_text = cause;
         qe.ev.account_error.cause = qe.message_text.c_str();
         carrier_push_event(c, std::move(qe));
         return;

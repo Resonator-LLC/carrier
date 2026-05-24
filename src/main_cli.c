@@ -196,17 +196,23 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [OPTIONS]\n\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -d, --data-dir PATH      Jami data dir (default: platform default)\n");
-    fprintf(stderr, "  -a, --account ID         Load an existing account by libjami ID\n");
-    fprintf(stderr, "      --create-account N   Create a fresh account with display name N\n");
-    fprintf(stderr, "      --link-account       Create a new account in linking mode and\n");
-    fprintf(stderr, "                           print the import URI (DeviceLinkPin event)\n");
-    fprintf(stderr, "      --fifo-in PATH       Read from named pipe instead of stdin\n");
-    fprintf(stderr, "      --fifo-out PATH      Write to named pipe instead of stdout\n");
-    fprintf(stderr, "      --log LEVEL          error|warn|info|debug (default: error;\n");
-    fprintf(stderr, "                           falls back to CARRIER_LOG env var)\n");
-    fprintf(stderr, "  -h, --help               Show this help\n");
-    fprintf(stderr, "\nCarrier-cli requires exactly one of --account, --create-account, or --link-account.\n");
+    fprintf(stderr, "  -d, --data-dir PATH        Jami data dir (default: platform default)\n");
+    fprintf(stderr, "  -a, --account ID           Load an existing account by libjami ID\n");
+    fprintf(stderr, "      --create-account N     Create a fresh account with display name N\n");
+    fprintf(stderr, "      --import-account PATH  Import account from a .gz archive blob\n");
+    fprintf(stderr, "      --archive-password PIN Password for the archive (encrypted exports/imports)\n");
+    fprintf(stderr, "      --export-account PATH  After loading the account, export its archive to PATH and exit\n");
+    fprintf(stderr, "      --remove-account ID    Remove the named account from the data dir and exit\n");
+    fprintf(stderr, "      --link-account         Create a new account in linking mode and\n");
+    fprintf(stderr, "                             print the import URI (DeviceLinkPin event)\n");
+    fprintf(stderr, "      --fifo-in PATH         Read from named pipe instead of stdin\n");
+    fprintf(stderr, "      --fifo-out PATH        Write to named pipe instead of stdout\n");
+    fprintf(stderr, "      --log LEVEL            error|warn|info|debug (default: error;\n");
+    fprintf(stderr, "                             falls back to CARRIER_LOG env var)\n");
+    fprintf(stderr, "  -h, --help                 Show this help\n");
+    fprintf(stderr, "\nExactly one of --account, --create-account, --import-account, --link-account,\n");
+    fprintf(stderr, "or --remove-account is required. --export-account stacks on top of any of the\n");
+    fprintf(stderr, "first three to dump the archive after the account is ready.\n");
 }
 
 int main(int argc, char **argv)
@@ -214,20 +220,28 @@ int main(int argc, char **argv)
     const char *data_dir       = NULL;
     const char *account_id     = NULL;
     const char *create_display = NULL;
+    const char *import_archive = NULL;
+    const char *archive_pw     = NULL;
+    const char *export_path    = NULL;
+    const char *remove_id      = NULL;
     bool        link_account   = false;
     const char *fifo_in_path   = NULL;
     const char *fifo_out_path  = NULL;
     const char *log_level_arg  = NULL;
 
     static struct option long_opts[] = {
-        {"data-dir",       required_argument, 0, 'd'},
-        {"account",        required_argument, 0, 'a'},
-        {"create-account", required_argument, 0, 'C'},
-        {"link-account",   no_argument,       0, 'K'},
-        {"fifo-in",        required_argument, 0, 'I'},
-        {"fifo-out",       required_argument, 0, 'O'},
-        {"log",            required_argument, 0, 'L'},
-        {"help",           no_argument,       0, 'h'},
+        {"data-dir",         required_argument, 0, 'd'},
+        {"account",          required_argument, 0, 'a'},
+        {"create-account",   required_argument, 0, 'C'},
+        {"import-account",   required_argument, 0, 'M'},
+        {"archive-password", required_argument, 0, 'P'},
+        {"export-account",   required_argument, 0, 'X'},
+        {"remove-account",   required_argument, 0, 'R'},
+        {"link-account",     no_argument,       0, 'K'},
+        {"fifo-in",          required_argument, 0, 'I'},
+        {"fifo-out",         required_argument, 0, 'O'},
+        {"log",              required_argument, 0, 'L'},
+        {"help",             no_argument,       0, 'h'},
         {NULL, 0, NULL, 0},
     };
 
@@ -237,6 +251,10 @@ int main(int argc, char **argv)
             case 'd': data_dir = optarg; break;
             case 'a': account_id = optarg; break;
             case 'C': create_display = optarg; break;
+            case 'M': import_archive = optarg; break;
+            case 'P': archive_pw = optarg; break;
+            case 'X': export_path = optarg; break;
+            case 'R': remove_id = optarg; break;
             case 'K': link_account = true; break;
             case 'I': fifo_in_path = optarg; break;
             case 'O': fifo_out_path = optarg; break;
@@ -246,9 +264,13 @@ int main(int argc, char **argv)
         }
     }
 
-    int mode_count = (account_id ? 1 : 0) + (create_display ? 1 : 0) + (link_account ? 1 : 0);
+    int mode_count = (account_id ? 1 : 0) +
+                     (create_display ? 1 : 0) +
+                     (import_archive ? 1 : 0) +
+                     (link_account ? 1 : 0) +
+                     (remove_id ? 1 : 0);
     if (mode_count != 1) {
-        fprintf(stderr, "carrier: exactly one of --account, --create-account, or --link-account required\n");
+        fprintf(stderr, "carrier: exactly one of --account, --create-account, --import-account, --link-account, or --remove-account required\n");
         return 1;
     }
 
@@ -294,29 +316,80 @@ int main(int argc, char **argv)
     }
     carrier_set_log_level(c, log_level);
 
+    /* Install the Turtle emitter up-front so AccountError / AccountReady /
+     * AccountArchiveReady events fired during the synchronous create / import
+     * / export paths still reach stdout — otherwise a failed --import-account
+     * would exit before carrier_iterate ever runs and the AccountError that
+     * carries the cause token would be dropped on the floor. */
+    carrier_set_event_callback(c, turtle_emit_event, out_stream);
+    turtle_emit_prefixes(out_stream);
+
+    /* --remove-account is a one-shot maintenance op — tear down and exit. */
+    if (remove_id) {
+        int rrc = carrier_remove_account(c, remove_id);
+        if (rrc != 0) {
+            fprintf(stderr, "carrier: carrier_remove_account(%s) failed\n", remove_id);
+        } else {
+            fprintf(stderr, "carrier: removed account %s\n", remove_id);
+        }
+        carrier_iterate(c);
+        carrier_free(c);
+        return rrc == 0 ? 0 : 1;
+    }
+
+    char loaded_id[CARRIER_ACCOUNT_ID_LEN];
+    loaded_id[0] = '\0';
+
     if (create_display) {
-        char new_id[CARRIER_ACCOUNT_ID_LEN];
-        if (carrier_create_account(c, create_display, new_id) != 0) {
+        /* Pass archive_pw through to create_account so the freshly-minted
+         * keystore is encrypted with the same password the caller intends
+         * to use for --export-account / future imports. libjami's
+         * exportToFile needs the keystore password to decrypt the source
+         * before re-encrypting the destination. */
+        if (carrier_create_account(c, create_display, NULL, archive_pw, loaded_id) != 0) {
             fprintf(stderr, "carrier: carrier_create_account failed\n");
+            carrier_iterate(c);
             carrier_free(c);
             return 1;
         }
-        fprintf(stderr, "carrier: created account %s\n", new_id);
+        fprintf(stderr, "carrier: created account %s\n", loaded_id);
+    } else if (import_archive) {
+        if (carrier_create_account(c, NULL, import_archive, archive_pw, loaded_id) != 0) {
+            fprintf(stderr, "carrier: carrier_create_account(import) failed\n");
+            carrier_iterate(c);
+            carrier_free(c);
+            return 1;
+        }
+        fprintf(stderr, "carrier: imported account %s from %s\n", loaded_id, import_archive);
     } else if (link_account) {
-        char new_id[CARRIER_ACCOUNT_ID_LEN];
-        if (carrier_create_linking_account(c, new_id) != 0) {
+        if (carrier_create_linking_account(c, loaded_id) != 0) {
             fprintf(stderr, "carrier: carrier_create_linking_account failed\n");
+            carrier_iterate(c);
             carrier_free(c);
             return 1;
         }
-        fprintf(stderr, "carrier: created linking-mode account %s\n", new_id);
+        fprintf(stderr, "carrier: created linking-mode account %s\n", loaded_id);
     } else {
         if (carrier_load_account(c, account_id) != 0) {
             fprintf(stderr, "carrier: carrier_load_account(%s) failed\n", account_id);
+            carrier_iterate(c);
             carrier_free(c);
             return 1;
         }
-        fprintf(stderr, "carrier: loaded account %s\n", account_id);
+        snprintf(loaded_id, sizeof(loaded_id), "%s", account_id);
+        fprintf(stderr, "carrier: loaded account %s\n", loaded_id);
+    }
+
+    /* --export-account stacks on the above: dump the archive, drain the
+     * resulting AccountArchiveReady through the turtle emitter, then exit
+     * without entering the Turtle-stdin loop. */
+    if (export_path) {
+        int xrc = carrier_export_account(c, loaded_id, export_path, archive_pw);
+        carrier_iterate(c);  /* drain AccountArchiveReady or AccountError */
+        carrier_free(c);
+        if (fifo_in_path  && in_stream)  fclose(in_stream);
+        if (fifo_out_path && out_stream) fclose(out_stream);
+        return xrc == 0 ? 0 : 1;
     }
 
     int rc = run_turtle_mode(c, in_stream, out_stream, fifo_in_path);

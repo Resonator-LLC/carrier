@@ -65,6 +65,12 @@ struct AccountState
     std::string display_name;
     bool        registered = false;
 
+    /* Raw libjami RegistrationState string when it landed on an ERROR_*.
+     * Lets carrier_create_account / carrier_load_account distinguish
+     * "registration in progress (wait)" from "permanent failure (return -1
+     * now)" inside the same accounts_cv predicate. Empty when no error. */
+    std::string error_state;
+
     /* Cache: peer_uri → conversation_id for 1:1 Swarms. Seeded from
      * libjami::getConversations() on account load; updated on
      * ConversationReady signals. Guarded by Carrier::accounts_mtx. */

@@ -92,7 +92,8 @@ typedef enum {
     CARRIER_EVENT_CONNECTED,                /* libjami daemon up, account registered */
     CARRIER_EVENT_DISCONNECTED,             /* account lost registration */
     CARRIER_EVENT_ACCOUNT_READY,            /* account reached REGISTERED; safe to send */
-    CARRIER_EVENT_ACCOUNT_ERROR,            /* registration failed; see `cause` */
+    CARRIER_EVENT_ACCOUNT_ERROR,            /* registration/import/export failed; see `cause` */
+    CARRIER_EVENT_ACCOUNT_ARCHIVE_READY,    /* archive blob written to disk */
     CARRIER_EVENT_SELF_ID,                  /* response to carrier_get_id() */
     CARRIER_EVENT_TRUST_REQUEST,            /* peer sent us a trust request */
     CARRIER_EVENT_CONTACT_ONLINE,           /* peer reachable on the DHT */
@@ -140,10 +141,24 @@ typedef struct {
             char display_name[CARRIER_NAME_LEN];
         } account_ready;
 
-        /* Fires when registration fails or the account is unrecoverable. */
+        /* Fires when account provisioning, import, or export fails. `cause`
+         * is one of a closed token set:
+         *   - "wrong-pin"        archive could not be decrypted (bad password)
+         *   - "corrupted"        archive parse / signature check failed
+         *   - "not-found"        archive file unreadable (pre-validated)
+         *   - "register-timeout" 30 s REGISTERED wait expired
+         *   - "not-ready"        export attempted before AccountReady
+         *   - "write-failed"     export destination unwritable / libjami false
+         *   - "unknown"          libjami returned a state we don't translate
+         * Treat any cause outside this set as "unknown". */
         struct {
-            const char *cause;  /* libjami error string, callback-scoped */
+            const char *cause;  /* closed-vocabulary token, callback-scoped */
         } account_error;
+
+        /* Fires after carrier_export_account writes the archive successfully. */
+        struct {
+            char path[CARRIER_PATH_LEN];   /* absolute path of the .gz blob */
+        } account_archive_ready;
 
         /* Answer to carrier_get_id(). */
         struct {
@@ -474,21 +489,39 @@ void carrier_set_log_level(Carrier *c, CarrierLogLevel level);
  * ---------------------------------------------------------------------------*/
 
 /*
- * Create a fresh Jami account (new keypair, new 40-hex URI).
+ * Provision a Jami account.
  *
- * display_name:    human-readable name; published to contacts. May be NULL
- *                  or "" to leave unset.
- * out_account_id:  buffer receiving the newly-assigned libjami account ID,
- *                  NUL-terminated. Must be at least CARRIER_ACCOUNT_ID_LEN
- *                  bytes. Populated synchronously before this call returns.
+ * display_name:           human-readable name; published to contacts. May be
+ *                         NULL or "" to leave unset.
+ * archive_path_or_null:   absolute path to a `.gz` archive previously written
+ *                         by carrier_export_account (or by a vanilla Jami
+ *                         client). When non-NULL and non-empty, the account
+ *                         is imported from the archive; when NULL or empty,
+ *                         a fresh keypair + 40-hex URI is minted. The path
+ *                         is pre-validated with access(R_OK) before libjami
+ *                         is involved; on failure ACCOUNT_ERROR with cause
+ *                         "not-found" is enqueued and the call returns -1.
+ * archive_password_or_null: archive decryption password. May be NULL or ""
+ *                         when the archive has no password (matches libjami's
+ *                         `archiveHasPassword=false` model). Ignored when
+ *                         archive_path_or_null is NULL/empty.
+ * out_account_id:         buffer receiving the newly-assigned libjami account
+ *                         ID, NUL-terminated. Must be at least
+ *                         CARRIER_ACCOUNT_ID_LEN bytes. Populated synchronously
+ *                         before this call returns.
  *
- * The AccountReady event (once it fires) will carry this account_id in the
- * outer struct and the new self URI in `account_ready.self_uri`.
+ * Returns 0 on success, -1 on failure. On failure an ACCOUNT_ERROR event is
+ * enqueued with one of: "wrong-pin", "corrupted", "not-found",
+ * "register-timeout", "unknown".
  *
- * Returns 0 on success, -1 on failure (check log for libjami cause).
+ * The ACCOUNT_READY event (once it fires) carries this account_id in the
+ * outer struct and the self URI in `account_ready.self_uri`. For import,
+ * the URI is the one originally minted by the source device.
  */
 int carrier_create_account(Carrier    *c,
                            const char *display_name,
+                           const char *archive_path_or_null,
+                           const char *archive_password_or_null,
                            char        out_account_id[CARRIER_ACCOUNT_ID_LEN]);
 
 /*
@@ -503,6 +536,35 @@ int carrier_create_account(Carrier    *c,
  * Returns 0 on success, -1 if no such account exists under data_dir.
  */
 int carrier_load_account(Carrier *c, const char *account_id);
+
+/*
+ * Export an account to a portable .gz archive blob. Writes
+ * `<destination_path>` (overwriting if present). The caller is responsible
+ * for having waited on ACCOUNT_READY — this call does not synthesise that
+ * wait. On success an ACCOUNT_ARCHIVE_READY event is enqueued carrying the
+ * absolute path; on failure ACCOUNT_ERROR with one of "not-ready",
+ * "write-failed", "unknown".
+ *
+ * password: optional. NULL or "" produces an unencrypted archive matching
+ * the carrier_create_account default. Non-empty enables libjami's symmetric
+ * encryption; the same value must be supplied to carrier_create_account when
+ * importing.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int carrier_export_account(Carrier    *c,
+                           const char *account_id,
+                           const char *destination_path,
+                           const char *password);
+
+/*
+ * Tear down an account: removes its libjami handle, archive on disk, and any
+ * conversation Swarms that this device hosts. Idempotent for unknown account
+ * ids. Does not emit a typed event — synchronous cleanup only.
+ *
+ * Returns 0 on success or unknown id, -1 only if `c` or `account_id` is NULL.
+ */
+int carrier_remove_account(Carrier *c, const char *account_id);
 
 /* ---------------------------------------------------------------------------
  * Identity & presence

@@ -416,10 +416,17 @@ TEST_C_OBJ      = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_C_SRC:.c=.o))
 TEST_CXX_OBJ    = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_CXX_SRC:.cc=.o))
 TEST_SUPPORT    = $(BUILD_DIR)/rdf_canon.o $(SERD_OBJ)
 
-.PHONY: test
+.PHONY: test test-archive
 test: $(BUILD_DIR)/carrier-tests
 	@echo "  RUN   carrier-tests"
 	@$(BUILD_DIR)/carrier-tests
+
+# Drives carrier-cli through the create / export / import / remove flows
+# added for ISSUE-123 (Cut A). Pulls in libjami via a child process, so it
+# only runs after the main `make` produced build/carrier-cli.
+test-archive: $(BUILD_DIR)/carrier-cli
+	@echo "  RUN   archive_round_trip.py"
+	@python3 $(TEST_DIR)/archive_round_trip.py
 
 $(BUILD_DIR)/carrier-tests: $(TEST_C_OBJ) $(TEST_CXX_OBJ) $(TEST_SUPPORT) | $(BUILD_DIR)
 	@echo "  LD    $(@F)"

@@ -102,6 +102,13 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fputc('"', out);
             break;
 
+        case CARRIER_EVENT_ACCOUNT_ARCHIVE_READY:
+            emit_header(out, "AccountArchiveReady", ev->account_id);
+            fprintf(out, " ; carrier:path \"");
+            turtle_escape(out, ev->account_archive_ready.path);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_SELF_ID:
             emit_header(out, "SelfId", ev->account_id);
             fprintf(out, " ; carrier:selfUri \"");
