@@ -452,6 +452,24 @@ extern "C" int carrier_create_account(Carrier    *c,
     copy_to(out_account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
     CLOG_INFO(c, "SHIM", "%s account %s",
               importing ? "imported" : "created", accountId.c_str());
+
+    /* Import-account path (archive carries existing swarms) kicks the
+     * same history replay as carrier_load_account — fresh-create has no
+     * swarms so the loop is a no-op. See the comment in
+     * carrier_load_account for why this lives here instead of
+     * on_registration_state's cold-load loop. */
+    if (importing) {
+        try {
+            const auto convs = libjami::getConversations(accountId);
+            for (const auto &conv_id : convs) {
+                libjami::loadConversation(accountId, conv_id, "", 0);
+            }
+        } catch (const std::exception &e) {
+            CLOG_WARN(c, "SHIM",
+                      "import_account: history replay kick threw for %s: %s",
+                      accountId.c_str(), e.what());
+        }
+    }
     return 0;
 }
 
@@ -511,6 +529,28 @@ extern "C" int carrier_load_account(Carrier *c, const char *account_id)
         errored = (it != c->accounts.end() && !it->second.error_state.empty());
     }
     if (errored) return -1;
+
+    /* History replay kick (ISSUE-127). Now that `loadAccountAndConversation`
+     * has returned and REGISTERED has fired, every on-disk Swarm is fully
+     * hydrated in libjami's `conversations_` map — safe to ask for a
+     * git-log walk per swarm. The SwarmLoaded handler in carrier_jami_signals
+     * dispatches each commit as a TextMessage / GroupMessage / FileRecv
+     * event (replay path keeps own-author commits, unlike the live filter).
+     * The synthetic CONVERSATION_READY for each Swarm has already been
+     * pushed onto the carrier event queue by `on_registration_state`. */
+    try {
+        const auto convs = libjami::getConversations(account_id);
+        for (const auto &conv_id : convs) {
+            libjami::loadConversation(account_id, conv_id, "", 0);
+        }
+    } catch (const std::exception &e) {
+        CLOG_WARN(c, "SHIM",
+                  "load_account: history replay kick threw for %s: %s",
+                  account_id, e.what());
+        /* Non-fatal — account is still usable, just without cold-start
+         * history. Live messages will still surface. */
+    }
+
     return 0;
 }
 
@@ -870,6 +910,39 @@ extern "C" int carrier_send_conversation_message(Carrier    *c,
     }
     libjami::sendMessage(account_id, conversation_id, text,
                          /*replyTo=*/"", /*flag=*/0);
+    return 0;
+}
+
+extern "C" int carrier_load_conversation_messages(Carrier    *c,
+                                                  const char *account_id,
+                                                  const char *conversation_id,
+                                                  const char *from_message,
+                                                  size_t      n)
+{
+    if (!c || !account_id || !conversation_id) return -1;
+    /* libjami's loadConversation is async — it returns a request id (which
+     * we discard) and fires SwarmLoaded later from its io thread pool.
+     * Carrier's SwarmLoaded handler then dispatches the messages as
+     * TEXT_MESSAGE / GROUP_MESSAGE / FILE_RECV events. */
+    libjami::loadConversation(account_id,
+                              conversation_id,
+                              from_message ? from_message : "",
+                              n);
+    return 0;
+}
+
+extern "C" int carrier_clear_conversation_cache(Carrier    *c,
+                                                const char *account_id,
+                                                const char *conversation_id)
+{
+    if (!c || !account_id || !conversation_id) return -1;
+    /* libjami's `addToHistory` short-circuits when a commit id is already
+     * in the in-process quickAccess map (populated by SwarmMessageReceived
+     * for live commits), so a subsequent loadConversation returns nothing
+     * even though the on-disk DAG has the commits. Clearing the cache
+     * forces the next walk to re-populate from disk — the cold-start path
+     * naturally hits this state because the process is new. */
+    libjami::clearCache(account_id, conversation_id);
     return 0;
 }
 

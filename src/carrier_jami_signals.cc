@@ -158,6 +158,19 @@ void on_registration_state(Carrier *c,
             carrier_push_event(c, std::move(cev));
         }
 
+        /* History replay (ISSUE-127) does NOT happen here. REGISTERED can
+         * fire DURING `libjami::loadAccountAndConversation` — specifically
+         * after `doRegister()` but before `convModule->loadConversations()`
+         * has finished hydrating every Swarm's git repo from disk.
+         * Calling `libjami::loadConversation` at that point hits
+         * half-loaded SyncedConversation objects and the io-pool walk
+         * returns an empty `SwarmMessage` vector (observed empirically:
+         * antenna cold-start saw `msgs=0` for swarms with 10+ commits on
+         * disk). The replay kick lives in `carrier_load_account` /
+         * `carrier_create_account` instead, sequenced after the wait for
+         * REGISTERED returns, when `loadAccountAndConversation` is
+         * guaranteed to have completed. */
+
         /* Synthetic ContactName for each trusted contact whose vCard is on
          * disk. libjami's ProfileReceived only fires for NEW vCard commits
          * arriving via Swarm sync; on a restart against an already-synced
@@ -282,10 +295,26 @@ std::string resolve_conversation_mode(Carrier *c,
     return mode;
 }
 
-void on_swarm_message_received(Carrier *c,
-                               const std::string &accountId,
-                               const std::string &conversationId,
-                               const libjami::SwarmMessage &message)
+/* Dispatch a single Swarm message — used both by the live signal
+ * (on_swarm_message_received) and by the cold-start history replay path
+ * (on_swarm_loaded → loadConversation).
+ *
+ * is_replay=false (live): keeps the long-standing own-author filters —
+ *   - own file-offer commits are dropped (avoid the FileRecv echo for a
+ *     transfer the local side just initiated),
+ *   - own text/plain commits surface as MessageSent (carries the freshly-
+ *     minted commit id back so the optimistic UI row can be reconciled).
+ *
+ * is_replay=true (history): both filters are skipped so own historical
+ *   commits round-trip back through the same TextMessage / GroupMessage /
+ *   FileRecv events peer commits use. ISSUE-127: without this every cold-
+ *   restart renders an empty Saved-Messages chat (the only author there is
+ *   self, so a live-mode filter eats the entire history). */
+void dispatch_swarm_message(Carrier *c,
+                            const std::string &accountId,
+                            const std::string &conversationId,
+                            const libjami::SwarmMessage &message,
+                            bool is_replay)
 {
     auto get = [&](const char *key) -> std::string {
         auto it = message.body.find(key);
@@ -305,8 +334,11 @@ void on_swarm_message_received(Carrier *c,
         const std::string total_str   = get("totalSize");
         const std::string file_id     = get("fileId");
 
-        /* Skip our own offers echoed back via Swarm sync. */
-        {
+        /* Skip our own offers echoed back via Swarm sync — but only on
+         * the live path; replay must surface them so cold-restart chats
+         * (especially Saved Messages, where every author is self) render
+         * the historical attachments. */
+        if (!is_replay) {
             std::lock_guard<std::mutex> lock(c->accounts_mtx);
             auto it = c->accounts.find(accountId);
             if (it != c->accounts.end() && !it->second.self_uri.empty() &&
@@ -351,8 +383,12 @@ void on_swarm_message_received(Carrier *c,
      * skip the TextMessage path so consumers don't see their own messages
      * twice. status=0 here is the "committed locally" snapshot; libjami may
      * still emit later transitions via accountMessageStatusChanged for legacy
-     * routes. */
-    {
+     * routes.
+     *
+     * Replay skips this short-circuit: a historical own commit needs to
+     * become a TextMessage / GroupMessage so the bubble can render — there
+     * is no optimistic UI row to reconcile against on cold start. */
+    if (!is_replay) {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);
         auto it = c->accounts.find(accountId);
         if (it != c->accounts.end() && !it->second.self_uri.empty() &&
@@ -415,6 +451,45 @@ void on_swarm_message_received(Carrier *c,
     }
 
     carrier_push_event(c, std::move(qe));
+}
+
+/* Live SwarmMessageReceived: every new commit libjami sees on any of our
+ * Swarms. Thin wrapper around dispatch_swarm_message; the is_replay=false
+ * arm keeps the long-standing own-author filters in place. */
+void on_swarm_message_received(Carrier *c,
+                               const std::string &accountId,
+                               const std::string &conversationId,
+                               const libjami::SwarmMessage &message)
+{
+    dispatch_swarm_message(c, accountId, conversationId, message,
+                           /*is_replay=*/false);
+}
+
+/* ---------------------------------------------------------------------------
+ * SwarmLoaded handler — fires once per `libjami::loadConversation` call
+ * with the requested window of historical commits. The cold-load loop in
+ * on_registration_state kicks one of these per Swarm on disk so messenger
+ * pipelines see a TextMessage / GroupMessage / FileRecv stream that
+ * recreates the chat after a restart (ISSUE-127).
+ *
+ * Messages arrive newest-first from libjami's git walker. Reverse the
+ * vector so consumers see them in commit order — matches the live
+ * SwarmMessageReceived flow and keeps history append-only on the
+ * pipeline side.
+ * ---------------------------------------------------------------------------*/
+
+void on_swarm_loaded(Carrier *c,
+                     std::uint32_t /*id*/,
+                     const std::string &accountId,
+                     const std::string &conversationId,
+                     const std::vector<libjami::SwarmMessage> &messages)
+{
+    CLOG_DEBUG(c, "SHIM", "SwarmLoaded account=%s conv=%s msgs=%zu",
+               accountId.c_str(), conversationId.c_str(), messages.size());
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        dispatch_swarm_message(c, accountId, conversationId, *it,
+                               /*is_replay=*/true);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1045,6 +1120,16 @@ void carrier_register_signals(Carrier *c)
         [c](const std::string &accountId, const std::string &conversationId,
             const libjami::SwarmMessage &message) {
             on_swarm_message_received(c, accountId, conversationId, message);
+        }));
+
+    /* Cold-start history replay (ISSUE-127). on_registration_state kicks a
+     * libjami::loadConversation per existing Swarm; libjami fires this
+     * signal back with the requested window of commits. */
+    handlers.insert(exportable_callback<VS::SwarmLoaded>(
+        [c](std::uint32_t id, const std::string &accountId,
+            const std::string &conversationId,
+            std::vector<libjami::SwarmMessage> messages) {
+            on_swarm_loaded(c, id, accountId, conversationId, messages);
         }));
 
     handlers.insert(exportable_callback<VS::ConversationReady>(

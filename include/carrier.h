@@ -754,6 +754,47 @@ int carrier_send_conversation_message(Carrier    *c,
                                       const char *text);
 
 /*
+ * Replay the history of a Swarm conversation. Walks libjami's local git DAG
+ * and surfaces each commit as the same CARRIER_EVENT_TEXT_MESSAGE /
+ * GROUP_MESSAGE / FILE_RECV consumers already process for live traffic —
+ * including commits authored by self (the live path collapses those into
+ * MESSAGE_SENT, which carries the id but no body; replay surfaces the body
+ * so the bubble can render on cold start).
+ *
+ * Cold-load issues this automatically per Swarm on REGISTERED so messenger
+ * UIs survive a restart (ISSUE-127). Callers can additionally invoke it
+ * for pagination ("load older") once they need windowed access.
+ *
+ * from_message: commit id to anchor the walk at, or "" for the swarm tip.
+ * n:            max commits to return, or 0 for "all back to root".
+ *
+ * Returns 0 on enqueue, -1 on validation failure. The actual message events
+ * arrive asynchronously after libjami's io thread pool finishes the walk.
+ */
+int carrier_load_conversation_messages(Carrier    *c,
+                                       const char *account_id,
+                                       const char *conversation_id,
+                                       const char *from_message,
+                                       size_t      n);
+
+/*
+ * Drop libjami's in-memory commit cache for a conversation, forcing the next
+ * `carrier_load_conversation_messages` (or any other libjami history walk)
+ * to repopulate from the on-disk git DAG. The on-disk DAG is unaffected —
+ * only the in-process cache is cleared.
+ *
+ * Cold-start naturally has an empty cache; this verb is for callers that
+ * want to refresh inside a long-running process (e.g. tests that exercise
+ * the replay path without spawning a second process, or radios that pull
+ * a fresh archive in and need libjami to re-walk).
+ *
+ * Returns 0 on enqueue, -1 on validation failure.
+ */
+int carrier_clear_conversation_cache(Carrier    *c,
+                                     const char *account_id,
+                                     const char *conversation_id);
+
+/*
  * Accept an inbound invitation to a Swarm conversation. The Swarm clones
  * and CARRIER_EVENT_CONVERSATION_READY fires once enough of the DAG is
  * available to participate.
