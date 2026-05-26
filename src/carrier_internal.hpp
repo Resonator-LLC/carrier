@@ -100,6 +100,16 @@ struct AccountState
      * signal whenever the swarm replays the cached profile commit, e.g.
      * on every account reconnect). Guarded by accounts_mtx. */
     std::unordered_map<std::string, std::string> contact_names;
+
+    /* Cache: conversation_id of this account's "Saved Messages" swarm
+     * (single-member-self). Populated lazily by the first
+     * carrier_get_saved_conversation call (find-or-create against
+     * libjami); subsequent calls short-circuit on the cache so we don't
+     * re-enter libjami::getConversationMembers on a freshly-minted swarm
+     * (which has been observed to throw 'mutex lock failed: Invalid
+     * argument' before libjami's per-swarm state has fully settled).
+     * Empty until first resolution. Guarded by accounts_mtx. */
+    std::string saved_conversation_id;
 };
 
 /* ---------------------------------------------------------------------------

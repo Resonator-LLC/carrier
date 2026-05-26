@@ -757,23 +757,42 @@ extern "C" int carrier_get_saved_conversation(Carrier *c, const char *account_id
 {
     if (!c || !account_id) return -1;
 
-    /* Pull the self URI from the account cache. If the account is still
-     * mid-registration, fall back to a direct getAccountDetails read so the
-     * find-or-create can run before AccountReady has been observed by the
-     * embedder (it is enqueued separately, and a pipeline that emits
-     * GetSavedConversation immediately after AccountReady will observe a
-     * populated cache — but the direct read keeps cold-load safe). */
+    /* Hit the per-account cache first. After the first successful resolve,
+     * subsequent calls short-circuit without touching libjami — this avoids
+     * re-entering libjami::getConversationMembers on a freshly-minted swarm,
+     * which has been observed to throw 'mutex lock failed: Invalid argument'
+     * before the swarm's internal state has fully settled. */
     std::string self_uri;
+    std::string saved_conv_id;
     {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);
         auto *acct = find_account(c, account_id);
         if (!acct) return -1;
         self_uri = acct->self_uri;
+        saved_conv_id = acct->saved_conversation_id;
     }
+
+    if (!saved_conv_id.empty()) {
+        QueuedEvent qe;
+        qe.ev.type = CARRIER_EVENT_SAVED_CONVERSATION;
+        qe.ev.timestamp = carrier_now_ms();
+        copy_to(qe.ev.account_id, CARRIER_ACCOUNT_ID_LEN, account_id);
+        copy_to(qe.ev.saved_conversation.conversation_id,
+                CARRIER_CONVERSATION_ID_LEN, saved_conv_id);
+        carrier_push_event(c, std::move(qe));
+        return 0;
+    }
+
     if (self_uri.empty()) {
-        const auto details = libjami::getAccountDetails(account_id);
-        if (auto it = details.find("Account.username"); it != details.end()) {
-            self_uri = it->second;
+        try {
+            const auto details = libjami::getAccountDetails(account_id);
+            if (auto it = details.find("Account.username"); it != details.end()) {
+                self_uri = it->second;
+            }
+        } catch (const std::exception &e) {
+            emit_error(c, account_id, "GetSavedConversation", "LibjamiFailure",
+                       std::string("getAccountDetails threw: ") + e.what());
+            return -1;
         }
     }
     if (self_uri.empty()) {
@@ -782,21 +801,32 @@ extern "C" int carrier_get_saved_conversation(Carrier *c, const char *account_id
         return -1;
     }
 
-    std::string saved_conv_id;
-    const auto convs = libjami::getConversations(account_id);
-    for (const auto &conv_id : convs) {
-        const auto members = libjami::getConversationMembers(account_id, conv_id);
-        if (members.size() != 1) continue;
-        const auto uri_it = members[0].find("uri");
-        if (uri_it == members[0].end()) continue;
-        if (uri_it->second == self_uri) {
-            saved_conv_id = conv_id;
-            break;
+    try {
+        const auto convs = libjami::getConversations(account_id);
+        for (const auto &conv_id : convs) {
+            const auto members = libjami::getConversationMembers(account_id, conv_id);
+            if (members.size() != 1) continue;
+            const auto uri_it = members[0].find("uri");
+            if (uri_it == members[0].end()) continue;
+            if (uri_it->second == self_uri) {
+                saved_conv_id = conv_id;
+                break;
+            }
         }
+    } catch (const std::exception &e) {
+        emit_error(c, account_id, "GetSavedConversation", "LibjamiFailure",
+                   std::string("getConversations/Members threw: ") + e.what());
+        return -1;
     }
 
     if (saved_conv_id.empty()) {
-        saved_conv_id = libjami::startConversation(account_id);
+        try {
+            saved_conv_id = libjami::startConversation(account_id);
+        } catch (const std::exception &e) {
+            emit_error(c, account_id, "GetSavedConversation", "LibjamiFailure",
+                       std::string("startConversation threw: ") + e.what());
+            return -1;
+        }
         if (saved_conv_id.empty()) {
             emit_error(c, account_id, "GetSavedConversation", "LibjamiFailure",
                        "startConversation returned empty id");
@@ -807,6 +837,7 @@ extern "C" int carrier_get_saved_conversation(Carrier *c, const char *account_id
     {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);
         if (auto *acct = find_account(c, account_id)) {
+            acct->saved_conversation_id = saved_conv_id;
             /* Tag as multi-party so SwarmMessageReceived dispatch routes
              * subsequent commits on this swarm to carrier:GroupMessage
              * (not carrier:TextMessage). */
