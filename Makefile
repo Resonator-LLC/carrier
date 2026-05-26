@@ -410,11 +410,14 @@ $(BUILD_DIR):
 # the surfaces touched by ISSUE-103 and ISSUE-104.
 
 TEST_DIR        = tests
-TEST_C_SRC      = test_main.c test_rdf_canon.c
+TEST_C_SRC      = test_main.c test_rdf_canon.c test_contact_restored.c
 TEST_CXX_SRC    = test_vcard_utils.cc
 TEST_C_OBJ      = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_C_SRC:.c=.o))
 TEST_CXX_OBJ    = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_CXX_SRC:.cc=.o))
-TEST_SUPPORT    = $(BUILD_DIR)/rdf_canon.o $(SERD_OBJ)
+# turtle_emit.o is normally a CLI-only object (it depends on carrier.h's
+# event union, not on libjami). test_contact_restored.c links against it
+# directly so the C-side turtle wire shape is pinned by a unit test.
+TEST_SUPPORT    = $(BUILD_DIR)/rdf_canon.o $(BUILD_DIR)/turtle_emit.o $(SERD_OBJ)
 
 .PHONY: test test-archive test-saved
 test: $(BUILD_DIR)/carrier-tests

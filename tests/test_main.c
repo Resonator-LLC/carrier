@@ -15,9 +15,14 @@ int test_current_failed = 0;
  *
  * test_turtle_emit_all (in tests/test_turtle_emit.c) targets the
  * pre-Jami CarrierEvent layout and is excluded from the build pending a
- * v2 rewrite. The Makefile's TEST_C_SRC list reflects that. */
+ * v2 rewrite. The Makefile's TEST_C_SRC list reflects that.
+ *
+ * test_contact_restored_all (tests/test_contact_restored.c) covers the
+ * one new turtle-emit case ISSUE-127 added. It links against the live
+ * turtle_emit.c so the wire shape can't drift silently from the C side. */
 void test_vcard_utils_all(void);
 void test_rdf_canon_all(void);
+void test_contact_restored_all(void);
 
 int main(void)
 {
@@ -26,6 +31,7 @@ int main(void)
 
     test_vcard_utils_all();
     test_rdf_canon_all();
+    test_contact_restored_all();
 
     printf("\n------------------\n");
     printf("%d tests, %d passed, %d failed\n",

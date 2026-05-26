@@ -66,7 +66,7 @@ using carrier_vcard::vcard_path_for_peer;
 /* Forward decl: replay sits below on_registration_state (it's a sibling of
  * on_profile_received), but on_registration_state needs to call it to plug
  * the silent-libjami-restart gap. */
-void replay_contact_names(Carrier *c, const std::string &accountId);
+void replay_contacts(Carrier *c, const std::string &accountId);
 
 /* ---------------------------------------------------------------------------
  * Handler bodies
@@ -171,13 +171,20 @@ void on_registration_state(Carrier *c,
          * REGISTERED returns, when `loadAccountAndConversation` is
          * guaranteed to have completed. */
 
-        /* Synthetic ContactName for each trusted contact whose vCard is on
-         * disk. libjami's ProfileReceived only fires for NEW vCard commits
-         * arriving via Swarm sync; on a restart against an already-synced
-         * Swarm the signal stays silent. Without this replay, consumers
-         * gating on carrier:ContactName never learn the peer's displayName
-         * and render the bare URI instead. See ISSUE-103. */
-        replay_contact_names(c, accountId);
+        /* Synthetic ContactRestored for every entry returned by
+         * libjami::getContacts(accountId). Plugs the cold-start hole:
+         * libjami's ProfileReceived only fires when a NEW vCard arrives
+         * via Swarm sync, and NewBuddyNotification (Presence) doesn't
+         * fire on restart for already-trusted peers. Without this replay,
+         * consumers learn about a trusted contact only when a vCard or
+         * presence ping happens to land — which never happens for a
+         * peer whose cached vCard is empty (or missing FN). The replay
+         * emits one ContactRestored per known peer regardless of vCard
+         * state; carrier:displayName is best-effort and may be empty
+         * (consumers fall back to rendering the bare URI). A real
+         * carrier:ContactName follows when the vCard arrives via Swarm
+         * sync. See ISSUE-127. */
+        replay_contacts(c, accountId);
         return;
     }
 
@@ -599,18 +606,30 @@ void on_profile_received(Carrier *c,
     carrier_push_event(c, std::move(qe));
 }
 
-/* Replay synthetic CARRIER_EVENT_CONTACT_NAME events for every trusted
- * contact whose vCard is cached on disk. Called from on_registration_state
- * at AccountReady time to plug the gap left by libjami: its
- * ConfigurationSignal::ProfileReceived only fires when a NEW vCard commit
- * arrives via Swarm sync. On a restart against an already-synced Swarm,
- * libjami stays silent — historical vCard commits aren't replayed, so
- * consumers gating on carrier:ContactName would never learn the peer's
- * displayName and would fall back to rendering the bare URI.
+/* Replay synthetic CARRIER_EVENT_CONTACT_RESTORED events for every entry
+ * returned by libjami::getContacts(accountId). Called from
+ * on_registration_state at AccountReady to plug the cold-start gap:
  *
- * Mirrors the synthetic-ConversationReady replay just above this site:
- * the carrier owns the cross-restart consistency contract, not libjami. */
-void replay_contact_names(Carrier *c, const std::string &accountId)
+ *   - ConfigurationSignal::ProfileReceived only fires when a NEW vCard
+ *     commit arrives via Swarm sync; on restart against an already-synced
+ *     Swarm libjami stays silent, so a ContactName-only replay misses
+ *     anyone whose vCard FN is empty (or whose .vcf is a 0-byte stub).
+ *   - PresenceSignal::NewBuddyNotification doesn't auto-fire for
+ *     already-trusted peers on restart either, so the messenger pipeline
+ *     has no other path to learn the peer exists.
+ *
+ * Emit ONE ContactRestored per known peer regardless of vCard state.
+ * `display_name` is best-effort: present if the cached vCard at
+ * <data_dir>/jami/<account>/profiles/<base64(uri)>.vcf has an FN line,
+ * empty otherwise. Consumers render the bare URI for the empty case;
+ * a later carrier:ContactName from Swarm sync upgrades the displayName.
+ *
+ * Also seeds the per-account contact_names cache so a subsequent
+ * ProfileReceived for the same (uri, displayName) pair de-dupes
+ * correctly — the cache is keyed on URI and stores the (possibly empty)
+ * name so a real ContactName with a non-empty FN is detected as a
+ * change and emitted. See ISSUE-127. */
+void replay_contacts(Carrier *c, const std::string &accountId)
 {
     const auto contacts = libjami::getContacts(accountId);
     for (const auto &entry : contacts) {
@@ -618,34 +637,34 @@ void replay_contact_names(Carrier *c, const std::string &accountId)
         if (uit == entry.end() || uit->second.empty()) continue;
         const std::string &peer_uri = uit->second;
 
+        /* Read the cached vCard if present. Empty file / missing FN /
+         * missing file all collapse to an empty display_name — that's
+         * the whole point of separating ContactRestored from ContactName.
+         * Do NOT gate on vcard.empty() or display_name.empty(). */
         const std::string vcard_path =
             vcard_path_for_peer(c->data_dir, accountId, peer_uri);
         const std::string vcard = slurp_file(vcard_path);
-        if (vcard.empty()) continue;
+        const std::string display_name = vcard.empty()
+            ? std::string{}
+            : extract_vcard_fn(vcard);
 
-        const std::string display_name = extract_vcard_fn(vcard);
-        if (display_name.empty()) continue;
-
-        bool changed = false;
+        /* Seed the contact_names cache so a later ProfileReceived for the
+         * same (uri, name) pair is a no-op. Cache the (possibly empty)
+         * name; a real ContactName arrival with a non-empty FN will then
+         * register as a change and emit through on_profile_received. */
         {
             std::lock_guard<std::mutex> lock(c->accounts_mtx);
             auto ait = c->accounts.find(accountId);
             if (ait != c->accounts.end()) {
-                auto &cache = ait->second.contact_names;
-                auto cit = cache.find(peer_uri);
-                if (cit == cache.end() || cit->second != display_name) {
-                    cache[peer_uri] = display_name;
-                    changed = true;
-                }
+                ait->second.contact_names[peer_uri] = display_name;
             }
         }
-        if (!changed) continue;
 
         QueuedEvent qe;
-        stamp(qe.ev, CARRIER_EVENT_CONTACT_NAME);
+        stamp(qe.ev, CARRIER_EVENT_CONTACT_RESTORED);
         set_account(qe.ev, accountId);
-        copy_fixed(qe.ev.contact_name.contact_uri, CARRIER_URI_LEN, peer_uri);
-        copy_fixed(qe.ev.contact_name.display_name, CARRIER_NAME_LEN, display_name);
+        copy_fixed(qe.ev.contact_restored.contact_uri, CARRIER_URI_LEN, peer_uri);
+        copy_fixed(qe.ev.contact_restored.display_name, CARRIER_NAME_LEN, display_name);
         carrier_push_event(c, std::move(qe));
     }
 }

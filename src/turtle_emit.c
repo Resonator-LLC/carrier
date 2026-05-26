@@ -152,6 +152,19 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fputc('"', out);
             break;
 
+        case CARRIER_EVENT_CONTACT_RESTORED:
+            /* displayName is always emitted, even when empty — consumers
+             * rely on the field being present on every ContactRestored.
+             * An empty value signals "no vCard FN yet, render the bare
+             * URI"; a later carrier:ContactName upgrades it. */
+            emit_header(out, "ContactRestored", ev->account_id);
+            fprintf(out, " ; carrier:contactUri \"");
+            turtle_escape(out, ev->contact_restored.contact_uri);
+            fprintf(out, "\" ; carrier:displayName \"");
+            turtle_escape(out, ev->contact_restored.display_name);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_TEXT_MESSAGE:
             emit_header(out, "TextMessage", ev->account_id);
             fprintf(out, " ; carrier:contactUri \"");

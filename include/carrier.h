@@ -99,6 +99,7 @@ typedef enum {
     CARRIER_EVENT_CONTACT_ONLINE,           /* peer reachable on the DHT */
     CARRIER_EVENT_CONTACT_OFFLINE,          /* peer unreachable */
     CARRIER_EVENT_CONTACT_NAME,             /* peer published a display name */
+    CARRIER_EVENT_CONTACT_RESTORED,         /* trusted-contact replay at AccountReady */
     CARRIER_EVENT_TEXT_MESSAGE,             /* inbound 1:1 text message */
     CARRIER_EVENT_MESSAGE_SENT,             /* status update for an outbound message */
     CARRIER_EVENT_GROUP_MESSAGE,            /* inbound multi-party Swarm text message */
@@ -186,6 +187,23 @@ typedef struct {
             char contact_uri[CARRIER_URI_LEN];
             char display_name[CARRIER_NAME_LEN];
         } contact_name;
+
+        /* Fires once per entry returned by libjami::getContacts(account_id)
+         * at AccountReady time. Lets consumers hydrate their roster on a
+         * cold restart without depending on Swarm vCard re-sync or DHT
+         * presence — both of which can leave a trusted peer silently
+         * absent if no vCard FN is cached on disk yet (ISSUE-127).
+         *
+         * `display_name` is best-effort from the cached vCard at
+         * <data_dir>/jami/<account>/profiles/<base64(uri)>.vcf — if the
+         * file is missing or has no `FN:` line, it is the empty string.
+         * Consumers SHOULD render the bare URI in that case; a real
+         * carrier:ContactName will follow once the peer's vCard arrives
+         * via Swarm sync. */
+        struct {
+            char contact_uri[CARRIER_URI_LEN];
+            char display_name[CARRIER_NAME_LEN];   /* empty if no vCard FN on disk */
+        } contact_restored;
 
         /* Inbound 1:1 text message. At M2, Swarm conversations are an
          * implementation detail of 1:1 messaging — `conversation_id` is
