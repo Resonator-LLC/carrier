@@ -335,6 +335,16 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    if (strcmp(stmt->type, "GetSavedConversation") == 0) {
+        const char *account = require_account(c, stmt, "GetSavedConversation");
+        if (!account) return 0;
+        if (carrier_get_saved_conversation(c, account) != 0) {
+            carrier_emit_error(c, "GetSavedConversation", "LibjamiFailure",
+                               "carrier_get_saved_conversation failed");
+        }
+        return 0;
+    }
+
     if (strcmp(stmt->type, "SendConversationMsg") == 0) {
         const char *account = require_account(c, stmt, "SendConversationMsg");
         if (!account) return 0;

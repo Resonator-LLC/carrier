@@ -416,7 +416,7 @@ TEST_C_OBJ      = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_C_SRC:.c=.o))
 TEST_CXX_OBJ    = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_CXX_SRC:.cc=.o))
 TEST_SUPPORT    = $(BUILD_DIR)/rdf_canon.o $(SERD_OBJ)
 
-.PHONY: test test-archive
+.PHONY: test test-archive test-saved
 test: $(BUILD_DIR)/carrier-tests
 	@echo "  RUN   carrier-tests"
 	@$(BUILD_DIR)/carrier-tests
@@ -427,6 +427,13 @@ test: $(BUILD_DIR)/carrier-tests
 test-archive: $(BUILD_DIR)/carrier-cli
 	@echo "  RUN   archive_round_trip.py"
 	@python3 $(TEST_DIR)/archive_round_trip.py
+
+# Exercises carrier:GetSavedConversation / carrier:SavedConversation —
+# find-or-create the single-member-self swarm backing messenger2's
+# "Saved Messages" workspace. End-to-end against libjami.
+test-saved: $(BUILD_DIR)/carrier-cli
+	@echo "  RUN   saved_conversation.py"
+	@python3 $(TEST_DIR)/saved_conversation.py
 
 $(BUILD_DIR)/carrier-tests: $(TEST_C_OBJ) $(TEST_CXX_OBJ) $(TEST_SUPPORT) | $(BUILD_DIR)
 	@echo "  LD    $(@F)"

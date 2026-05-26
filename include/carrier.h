@@ -106,6 +106,7 @@ typedef enum {
     CARRIER_EVENT_GROUP_PEER_EXIT,          /* a member left or was banned */
     CARRIER_EVENT_CONVERSATION_REQUEST,     /* invitation to join a Swarm */
     CARRIER_EVENT_CONVERSATION_READY,       /* Swarm cloned/synced enough to use */
+    CARRIER_EVENT_SAVED_CONVERSATION,       /* reply to carrier_get_saved_conversation */
     CARRIER_EVENT_CONVERSATION_SYNC_FINISHED, /* per-account: all swarms synced */
     CARRIER_EVENT_SWARM_COMMIT,             /* raw Swarm git commit (DAG-level view) */
     CARRIER_EVENT_REACTION,                 /* peer reacted to a Swarm message (M4) */
@@ -251,6 +252,14 @@ typedef struct {
         struct {
             char conversation_id[CARRIER_CONVERSATION_ID_LEN];
         } conversation_ready;
+
+        /* Reply to carrier_get_saved_conversation. The conversation_id
+         * names a single-member-self swarm that backs the caller's
+         * "Saved Messages" workspace. Idempotent across calls and
+         * across devices linked to the same Jami account. */
+        struct {
+            char conversation_id[CARRIER_CONVERSATION_ID_LEN];
+        } saved_conversation;
 
         /* Per-account synchronization complete: all Swarms this account
          * is a member of have finished cloning. No conversation_id —
@@ -708,6 +717,26 @@ int carrier_create_conversation(Carrier    *c,
                                 const char *account_id,
                                 const char *privacy,
                                 char        out_conversation_id[CARRIER_CONVERSATION_ID_LEN]);
+
+/*
+ * Find-or-create the single-member-self swarm that backs the caller's
+ * "Saved Messages" workspace. Idempotent: subsequent calls against the
+ * same account return the same conversation_id. Reply asynchronously
+ * via CARRIER_EVENT_SAVED_CONVERSATION.
+ *
+ * Implementation: enumerates libjami::getConversations(account_id) and
+ * selects the swarm whose getConversationMembers returns exactly the
+ * self URI. On miss, mints a fresh swarm via libjami::startConversation
+ * (which has no public path to add a second initial member, so the new
+ * swarm is automatically single-member).
+ *
+ * Multi-device: libjami's Swarm DAG sync replicates the same swarm
+ * across any device linked to the same Jami account, so all devices
+ * converge on the same conversation_id without coordination.
+ *
+ * Returns 0 on enqueue, -1 if account_id is unknown.
+ */
+int carrier_get_saved_conversation(Carrier *c, const char *account_id);
 
 /*
  * Send a text message to a Swarm conversation by ID. For 1:1 Swarms, the

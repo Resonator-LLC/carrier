@@ -234,6 +234,13 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             fputc('"', out);
             break;
 
+        case CARRIER_EVENT_SAVED_CONVERSATION:
+            emit_header(out, "SavedConversation", ev->account_id);
+            fprintf(out, " ; carrier:conversationId \"");
+            turtle_escape(out, ev->saved_conversation.conversation_id);
+            fputc('"', out);
+            break;
+
         case CARRIER_EVENT_CONVERSATION_SYNC_FINISHED:
             /* libjami's ConversationSyncFinished signal is account-scoped;
              * no per-conversation id is available. Emit account-only. */
