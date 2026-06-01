@@ -65,8 +65,10 @@ else ifeq ($(PLATFORM),ios-sim-arm64)
 JAMI_SUFFIX := -ios-sim-fat
 else ifeq ($(PLATFORM),ios-sim-x86_64)
 JAMI_SUFFIX := -ios-sim-fat
+else ifeq ($(PLATFORM),android-arm64)
+JAMI_SUFFIX := -android-arm64
 else
-$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator))
+$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator|android-arm64))
 endif
 
 JAMI_SHA          := $(shell tr -d '[:space:]' < JAMI_VERSION 2>/dev/null)
@@ -112,8 +114,10 @@ else ifeq ($(PLATFORM),ios-sim-arm64)
 BUILD_DIR := build-ios-sim-arm64
 else ifeq ($(PLATFORM),ios-sim-x86_64)
 BUILD_DIR := build-ios-sim-x86_64
+else ifeq ($(PLATFORM),android-arm64)
+BUILD_DIR := build-android-arm64
 else
-$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator))
+$(error unknown PLATFORM=$(PLATFORM) (host|ios-device|ios-simulator|android-arm64))
 endif
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,37 @@ CXX := xcrun -sdk $(IOS_SDK) clang++
 AR  := xcrun -sdk $(IOS_SDK) ar
 endif
 
+# Android cross-compile: override CC/CXX/AR to the NDK clang toolchain. The
+# versioned clang wrapper (aarch64-linux-android24-clang) bakes in --target,
+# the API level, and the sysroot, so no extra arch/isysroot flags are needed —
+# only -fPIC, because these objects get archived into libcarrier.a and then
+# linked into antenna_ffi.so (a cdylib). Library-only, same as the iOS slice
+# (see libcarrier-android); the final libjami link happens in antenna/build.rs.
+ifeq ($(PLATFORM),android-arm64)
+ANDROID_API_LEVEL ?= 26
+ANDROID_HOST_TRIPLE := aarch64-linux-android
+ifeq ($(ANDROID_NDK_HOME),)
+ANDROID_NDK_HOME := $(ANDROID_NDK)
+endif
+ifeq ($(ANDROID_NDK_HOME),)
+ANDROID_SDK_DIR := $(firstword $(wildcard $(ANDROID_HOME)) $(wildcard $(ANDROID_SDK_ROOT)) $(HOME)/Library/Android/sdk)
+ANDROID_NDK_HOME := $(lastword $(sort $(wildcard $(ANDROID_SDK_DIR)/ndk/*)))
+endif
+ifeq ($(ANDROID_NDK_HOME),)
+$(error android build needs an NDK: set ANDROID_NDK_HOME)
+endif
+ifeq ($(UNAME_S),Darwin)
+ANDROID_NDK_HOST_TAG := darwin-x86_64
+else
+ANDROID_NDK_HOST_TAG := linux-x86_64
+endif
+ANDROID_NDK_BIN := $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_NDK_HOST_TAG)/bin
+ANDROID_FLAGS   := -fPIC
+CC  := $(ANDROID_NDK_BIN)/$(ANDROID_HOST_TRIPLE)$(ANDROID_API_LEVEL)-clang
+CXX := $(ANDROID_NDK_BIN)/$(ANDROID_HOST_TRIPLE)$(ANDROID_API_LEVEL)-clang++
+AR  := $(ANDROID_NDK_BIN)/llvm-ar
+endif
+
 CFLAGS   ?= -std=c11 -D_DEFAULT_SOURCE $(COMMON_WARN)
 CFLAGS   += $(COMMON_INC) -DSERD_STATIC
 
@@ -166,6 +201,10 @@ CXXFLAGS += $(COMMON_INC)
 ifneq ($(filter ios-device ios-sim-arm64 ios-sim-x86_64,$(PLATFORM)),)
 CFLAGS   += $(IOS_FLAGS)
 CXXFLAGS += $(IOS_FLAGS)
+endif
+ifeq ($(PLATFORM),android-arm64)
+CFLAGS   += $(ANDROID_FLAGS)
+CXXFLAGS += $(ANDROID_FLAGS)
 endif
 
 # ---------------------------------------------------------------------------
@@ -270,6 +309,9 @@ SERD_CFLAGS = -std=c11 -w -I$(SERD_INC) -I$(SERD_SRC_DIR) -DSERD_STATIC
 ifneq ($(filter ios-device ios-sim-arm64 ios-sim-x86_64,$(PLATFORM)),)
 SERD_CFLAGS += $(IOS_FLAGS)
 endif
+ifeq ($(PLATFORM),android-arm64)
+SERD_CFLAGS += $(ANDROID_FLAGS)
+endif
 
 # Library sources — mix of C++ (shim + internals that touch C++ state) and C.
 LIB_CXX_SRC = carrier_jami.cc carrier_jami_signals.cc carrier_events.cc carrier_log.cc
@@ -287,7 +329,7 @@ CLI_OBJ = $(addprefix $(BUILD_DIR)/, $(CLI_SRC:.c=.o))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean distclean test install uninstall asan tsan deps libjami libjami-build libjami-fetch libcarrier-ios
+.PHONY: all clean distclean test install uninstall asan tsan deps libjami libjami-build libjami-fetch libcarrier-ios libcarrier-android
 
 all: check-libjami $(BUILD_DIR)/libcarrier.a $(BUILD_DIR)/carrier-cli
 
@@ -326,6 +368,23 @@ else
 	@echo "ERROR: libcarrier-ios requires PLATFORM=ios-device|ios-simulator (got $(PLATFORM))" >&2
 	@exit 1
 endif
+
+# Cross-compile libcarrier.a for the Android arm64 ABI. Library-only — no
+# carrier-cli, same rationale as libcarrier-ios: the final link (libjami +
+# system libs) happens later, here in antenna_ffi.so via build.rs, not in this
+# Makefile. The .a is just carrier object files + serd objects compiled with
+# the NDK clang. Headers must exist ($(JAMI_INC)/jami; the C++ sources include
+# <jami/*.h>), but no contrib archives are linked.
+#
+# PLATFORM is forced to android-arm64 so the NDK toolchain + suffixes engage.
+ANDROID_JAMI_INC := $(XDG_CACHE_HOME)/resonator/libjami/$(JAMI_SHA)-android-arm64/include
+libcarrier-android:
+	@if [ ! -d "$(ANDROID_JAMI_INC)/jami" ]; then \
+	    echo "ERROR: Android libjami headers not found at $(ANDROID_JAMI_INC)/jami"; \
+	    echo "       Run: make libjami PLATFORM=android-arm64"; \
+	    exit 1; \
+	fi
+	@$(MAKE) PLATFORM=android-arm64 build-android-arm64/libcarrier.a
 
 # `make all` builds carrier-cli, which is host-only — the link flags below
 # target Darwin/Linux, not iOS. Calling `make all PLATFORM=ios-*` would

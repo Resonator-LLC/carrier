@@ -47,6 +47,16 @@ TARBALL_CACHE="$CACHE_ROOT/libjami-tarballs"
 # dhtnet — they need iOS 13.0+ for filesystem).
 export MIN_IOS_VERSION=14.5
 
+# Android NDK target. API 26 (Android 8.0) is the floor: the daemon's AAudio
+# audio layer (src/media/audio/aaudio) calls AAudioStream_* which the NDK marks
+# unavailable before API 26. Jami's own android cross-file uses 29; 26 is the
+# minimum that compiles. minSdk in the Station plugin + host app must match.
+# arm64-v8a is the only ABI we ship today (Apple-silicon emulators run arm64
+# system images, and it covers every modern physical device). Add x86_64 only
+# if an Intel emulator / Chromebook ever becomes a target.
+ANDROID_API_LEVEL=26
+ANDROID_ABI_DEFAULT=arm64-v8a
+
 # --- arg parsing ------------------------------------------------------------
 
 PLATFORM=host
@@ -66,9 +76,9 @@ for arg in "$@"; do
 done
 
 case "$PLATFORM" in
-  host|ios-device|ios-simulator|ios-all) ;;
+  host|ios-device|ios-simulator|ios-all|android-arm64) ;;
   *)
-    echo "unknown platform: $PLATFORM (host|ios-device|ios-simulator|ios-all)" >&2
+    echo "unknown platform: $PLATFORM (host|ios-device|ios-simulator|ios-all|android-arm64)" >&2
     exit 1
     ;;
 esac
@@ -80,6 +90,26 @@ case "$PLATFORM" in
       echo "iOS builds require a macOS host (got $(uname -s))" >&2
       exit 1
     }
+    ;;
+esac
+
+# Android slices cross-compile through the NDK's clang toolchain (works on a
+# macOS or Linux host). Resolve the NDK now so --print-prefix and the build
+# share one path: ANDROID_NDK_HOME, else ANDROID_NDK, else the newest NDK under
+# the SDK. Pin ONE NDK and reuse it for Cargokit (android.ndkVersion) too —
+# mismatched libc++ ABIs fail at link/runtime.
+case "$PLATFORM" in
+  android-*)
+    [ -n "${ANDROID_NDK_HOME:-}" ] || ANDROID_NDK_HOME="${ANDROID_NDK:-}"
+    if [ -z "$ANDROID_NDK_HOME" ]; then
+      _sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+      ANDROID_NDK_HOME="$(ls -d "$_sdk"/ndk/* 2>/dev/null | sort -V | tail -1)"
+    fi
+    [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ] || {
+      echo "android build needs an NDK: set ANDROID_NDK_HOME (resolved '$ANDROID_NDK_HOME')" >&2
+      exit 1
+    }
+    export ANDROID_NDK_HOME
     ;;
 esac
 
@@ -130,6 +160,15 @@ case "$PLATFORM" in
     "$0" --platform=ios-device "${recurse_args[@]+"${recurse_args[@]}"}"
     "$0" --platform=ios-simulator "${recurse_args[@]+"${recurse_args[@]}"}"
     exit 0
+    ;;
+  android-arm64)
+    BUILD_TRIPLE=""
+    ARTIFACT_TRIPLE="android-arm64"
+    case "$(uname -s)" in
+      Darwin) NPROC="$(sysctl -n hw.ncpu)" ;;
+      *)      NPROC="$(nproc)" ;;
+    esac
+    PREFIX="$CACHE_ROOT/libjami/$SHA-$ARTIFACT_TRIPLE"
     ;;
 esac
 
@@ -337,6 +376,141 @@ build_one_arch_ios() {
   done
 }
 
+# --- Android per-arch build -------------------------------------------------
+#
+# build_one_arch_android <arch> <stage_dir>
+#   arch:      arm64 (maps to ABI arm64-v8a; the only slice we ship today)
+#   stage_dir: where to drop .a files (== PREFIX for the single-arch case)
+#
+# Cross-compiles through the NDK clang toolchain — no xcrun, no gas-preprocessor
+# (clang's integrated assembler handles arm64). The contrib build honours
+# env-set CC/CXX/AR/... (contrib/src/main.mak guards each with `origin`, so an
+# environment value wins over the `$(CROSS_COMPILE)gcc` default the NDK lacks)
+# and reads ANDROID_NDK/ANDROID_ABI/ANDROID_API at bootstrap time
+# (contrib/bootstrap check_android_sdk → HAVE_ANDROID, which routes cmake
+# packages through $(ANDROID_NDK)/build/cmake/android.toolchain.cmake).
+
+build_one_arch_android() {
+  local arch="$1"
+  local stage_dir="$2"
+
+  local abi host_triple
+  case "$arch" in
+    arm64) abi="$ANDROID_ABI_DEFAULT"; host_triple=aarch64-linux-android ;;
+    *) echo "unknown android arch: $arch" >&2; return 1 ;;
+  esac
+
+  local ndk_host_tag
+  case "$(uname -s)" in
+    Darwin) ndk_host_tag=darwin-x86_64 ;;   # NDK ships only x86_64 prebuilts (run under Rosetta)
+    Linux)  ndk_host_tag=linux-x86_64 ;;
+    *) echo "unsupported android build host: $(uname -s)" >&2; return 1 ;;
+  esac
+  local ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$ndk_host_tag/bin"
+  local clang="$ndk_bin/${host_triple}${ANDROID_API_LEVEL}-clang"
+  [ -x "$clang" ] || {
+    echo "NDK clang not found: $clang (ANDROID_NDK_HOME=$ANDROID_NDK_HOME)" >&2
+    return 1
+  }
+
+  local contrib_build="$SRC_DIR/contrib/native-android-$arch"
+  local contrib_install="$SRC_DIR/contrib/$host_triple"
+  local cmake_build="$SRC_DIR/build-android-$arch"
+
+  mkdir -p "$contrib_build" "$contrib_install"
+
+  echo "==> [android-$arch] contrib bootstrap+build (NDK $ndk_host_tag, API $ANDROID_API_LEVEL, ABI $abi)"
+  (
+    cd "$contrib_build"
+    export PATH="$ndk_bin:$PATH"
+    # Consumed by contrib/bootstrap check_android_sdk + main.mak's HAVE_ANDROID
+    # cmake recipe.
+    export ANDROID_NDK="$ANDROID_NDK_HOME"
+    export ANDROID_ABI="$abi"
+    export ANDROID_API="android-$ANDROID_API_LEVEL"
+    # NDK toolchain. clang wrapper bakes in --target + API; llvm-* handle the
+    # LTO bitcode the android contrib emits (cmake recipe forces IPO=ON).
+    export CC="$clang"
+    export CXX="${clang}++"
+    export AR="$ndk_bin/llvm-ar"
+    export RANLIB="$ndk_bin/llvm-ranlib"
+    export STRIP="$ndk_bin/llvm-strip"
+    export NM="$ndk_bin/llvm-nm"
+    export LD="$ndk_bin/ld.lld"
+    export CCAS="$clang"
+
+    # Autoconf cross probes (gmp/gnutls/nettle) compile AND run a conftest on
+    # the build host. Unlike iOS there's no SDKROOT leak to break a bare cc, so
+    # the host compiler emits a host-runnable binary directly.
+    export CC_FOR_BUILD=/usr/bin/cc
+    export CXX_FOR_BUILD=/usr/bin/c++
+    export CPP_FOR_BUILD="/usr/bin/cc -E"
+    export CFLAGS_FOR_BUILD=""
+    export CXXFLAGS_FOR_BUILD=""
+    export CPPFLAGS_FOR_BUILD=""
+    export LDFLAGS_FOR_BUILD=""
+
+    # Cross-compile pkg-config hygiene. Restrict pkg-config to the contrib
+    # prefix so packages don't auto-detect the BUILD host's libraries. Upstream
+    # Jami's android contrib doesn't pass --without-brotli/--without-zstd to
+    # gnutls (unlike its iOS arm), so on a macOS host gnutls's configure finds
+    # Homebrew's libbrotli*/libzstd .pc files and enables RFC 8879 cert
+    # compression — leaving Brotli*/ZSTD_* undefined in the final .so (no
+    # target archive provides them → dlopen fails). LIBDIR replaces the default
+    # system search path; contrib deps (nettle, …) still resolve from here.
+    export PKG_CONFIG_LIBDIR="$contrib_install/lib/pkgconfig"
+
+    ../bootstrap \
+      --host="$host_triple" \
+      --prefix="$contrib_install" \
+      --disable-libav \
+      --enable-ffmpeg \
+      --disable-plugin \
+      --disable-libarchive \
+      --disable-dbus
+
+    make fetch
+    make -j"$NPROC"
+  )
+
+  echo "==> [android-$arch] daemon cmake"
+  if [ "$FORCE" -eq 1 ] || [ ! -f "$cmake_build/libjami-core.a" ]; then
+    rm -rf "$cmake_build"
+    (
+      cd "$SRC_DIR"
+      export PKG_CONFIG_PATH="$contrib_install/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+      cmake -S . -B "$cmake_build" \
+        -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+        -DANDROID_ABI="$abi" \
+        -DANDROID_PLATFORM="android-$ANDROID_API_LEVEL" \
+        -DANDROID_STL=c++_shared \
+        -DCMAKE_FIND_ROOT_PATH="$contrib_install" \
+        -DCMAKE_PREFIX_PATH="$contrib_install" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_CONTRIB=OFF \
+        -DJAMI_DBUS=OFF \
+        -DJAMI_PLUGIN=OFF \
+        -DCMAKE_BUILD_TYPE=Release
+      cmake --build "$cmake_build" -j"$NPROC"
+    )
+  fi
+
+  echo "==> [android-$arch] stage to $stage_dir"
+  mkdir -p "$stage_dir/lib"
+  cp "$cmake_build/libjami-core.a" "$stage_dir/lib/"
+  # Strip the android host-triple suffix (-aarch64-unknown-linux-android24.a)
+  # off pj*/srtp/yuv archives so the prefix uses flat names (libpj.a). build.rs
+  # then uses an empty pj suffix on android — same shape as the iOS staging.
+  local src base dst
+  for src in "$contrib_install/lib/"*.a; do
+    [ -f "$src" ] || continue
+    base="$(basename "$src")"
+    dst="$(echo "$base" | sed -E "s/-(aarch64|arm|armv7a|x86_64|i686)(-unknown)?-linux-android(eabi)?[0-9]*\.a$/.a/")"
+    cp "$src" "$stage_dir/lib/$dst"
+  done
+}
+
 # --- main per-platform dispatch ---------------------------------------------
 
 case "$PLATFORM" in
@@ -429,6 +603,13 @@ case "$PLATFORM" in
       fi
     done
 
+    cp "$SRC_DIR/src/jami/"*.h "$PREFIX/include/jami/"
+    ;;
+
+  android-arm64)
+    rm -rf "$PREFIX"
+    mkdir -p "$PREFIX/lib" "$PREFIX/include/jami"
+    build_one_arch_android arm64 "$PREFIX"
     cp "$SRC_DIR/src/jami/"*.h "$PREFIX/include/jami/"
     ;;
 esac
