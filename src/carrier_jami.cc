@@ -721,6 +721,46 @@ extern "C" int carrier_remove_contact(Carrier    *c,
     return 0;
 }
 
+extern "C" int carrier_block_peer(Carrier    *c,
+                                  const char *account_id,
+                                  const char *contact_uri)
+{
+    if (!c || !account_id || !contact_uri) return -1;
+
+    /* Network layer: ban at the daemon. removeContact(ban=true) is Jami's
+     * "banned contact" — text/calls from this identity are no longer
+     * acknowledged or answered, and the ban persists on disk + syncs across
+     * the user's linked devices. */
+    libjami::removeContact(account_id, contact_uri, /*ban=*/true);
+
+    /* Boundary layer: record the identity so dispatch_swarm_message drops its
+     * group commits and file offers too (1:1 ban does not cover those). */
+    std::lock_guard<std::mutex> lock(c->accounts_mtx);
+    if (auto *acct = find_account(c, account_id)) {
+        acct->blocked_peers.insert(contact_uri);
+        acct->peer_conversations.erase(contact_uri);
+    }
+    return 0;
+}
+
+extern "C" int carrier_unblock_peer(Carrier    *c,
+                                    const char *account_id,
+                                    const char *contact_uri)
+{
+    if (!c || !account_id || !contact_uri) return -1;
+
+    /* Lift the ban. addContact re-admits the identity (un-bans); it does not
+     * re-create a conversation or trust — that still goes through the normal
+     * trust-request flow. */
+    libjami::addContact(account_id, contact_uri);
+
+    std::lock_guard<std::mutex> lock(c->accounts_mtx);
+    if (auto *acct = find_account(c, account_id)) {
+        acct->blocked_peers.erase(contact_uri);
+    }
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Messaging
  * ---------------------------------------------------------------------------*/

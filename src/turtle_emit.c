@@ -156,12 +156,17 @@ void turtle_emit_event(const CarrierEvent *ev, void *userdata)
             /* displayName is always emitted, even when empty — consumers
              * rely on the field being present on every ContactRestored.
              * An empty value signals "no vCard FN yet, render the bare
-             * URI"; a later carrier:ContactName upgrades it. */
+             * URI"; a later carrier:ContactName upgrades it. carrier:blocked
+             * (CMP-002) is likewise always present: "true" when the peer is
+             * libjami-banned (blocked in a prior session) so consumers
+             * re-hydrate their render gate / blocklist from the durable ban. */
             emit_header(out, "ContactRestored", ev->account_id);
             fprintf(out, " ; carrier:contactUri \"");
             turtle_escape(out, ev->contact_restored.contact_uri);
             fprintf(out, "\" ; carrier:displayName \"");
             turtle_escape(out, ev->contact_restored.display_name);
+            fprintf(out, "\" ; carrier:blocked \"%s",
+                    ev->contact_restored.blocked ? "true" : "false");
             fputc('"', out);
             break;
 

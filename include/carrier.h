@@ -203,6 +203,16 @@ typedef struct {
         struct {
             char contact_uri[CARRIER_URI_LEN];
             char display_name[CARRIER_NAME_LEN];   /* empty if no vCard FN on disk */
+            /* CMP-002 — true when this restored contact is libjami-banned
+             * (the user blocked them in a prior session). libjami persists the
+             * ban on disk + syncs it across linked devices, so the AccountReady
+             * replay is the durable, serverless source of truth for the block
+             * across restarts. Consumers re-hydrate their render gate / blocklist
+             * from this flag rather than from any process-local state. The shim
+             * also re-seeds its own `blocked_peers` set in the same pass so
+             * dispatch_swarm_message keeps dropping the peer's group commits and
+             * file offers post-restart. */
+            bool blocked;
         } contact_restored;
 
         /* Inbound 1:1 text message. At M2, Swarm conversations are an
@@ -652,12 +662,41 @@ int carrier_discard_trust_request(Carrier    *c,
                                   const char *contact_uri);
 
 /*
- * Remove an established contact. Matches libjami `removeContact(..., ban=false)`;
- * banning is deferred until a real use case demands it.
+ * Remove an established contact. Matches libjami `removeContact(..., ban=false)`:
+ * the contact is dropped but may re-establish trust later. To deny a peer
+ * outright (content moderation / "block"), use carrier_block_peer instead.
  */
 int carrier_remove_contact(Carrier    *c,
                            const char *account_id,
                            const char *contact_uri);
+
+/*
+ * Block a peer by keypair identity (content moderation — CMP-002).
+ *
+ * Maps to libjami `removeContact(..., ban=true)`: the daemon stops
+ * acknowledging or answering text/calls from this identity (Jami's "banned
+ * contact" semantics), and the ban is persisted in the account's contact
+ * list on disk + synced across the user's linked devices. In addition, the
+ * shim records `contact_uri` in a per-account in-memory block set and drops
+ * any inbound Swarm commit authored by it before it becomes an event — so a
+ * blocked peer's group messages and file offers (which 1:1 trust does not
+ * govern) never surface either.
+ *
+ * Idempotent. Returns 0 on success, -1 on invalid URI / unknown account.
+ */
+int carrier_block_peer(Carrier    *c,
+                       const char *account_id,
+                       const char *contact_uri);
+
+/*
+ * Reverse carrier_block_peer: lift the ban (libjami `addContact`) and clear
+ * the identity from the in-memory block set so its content surfaces again.
+ * Note this does not re-establish trust or a conversation; it only undoes the
+ * ban. Idempotent. Returns 0 on success, -1 on invalid URI / unknown account.
+ */
+int carrier_unblock_peer(Carrier    *c,
+                         const char *account_id,
+                         const char *contact_uri);
 
 /* ---------------------------------------------------------------------------
  * Messaging (1:1)

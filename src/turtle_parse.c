@@ -301,6 +301,32 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    if (strcmp(stmt->type, "BlockContact") == 0) {
+        const char *account = require_account(c, stmt, "BlockContact");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "BlockContact", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
+        }
+        carrier_block_peer(c, account, uri);
+        return 0;
+    }
+
+    if (strcmp(stmt->type, "UnblockContact") == 0) {
+        const char *account = require_account(c, stmt, "UnblockContact");
+        if (!account) return 0;
+        const char *uri = find_pred(stmt, "contactUri");
+        if (!uri) {
+            carrier_emit_error(c, "UnblockContact", "MissingField",
+                               "carrier:contactUri required");
+            return 0;
+        }
+        carrier_unblock_peer(c, account, uri);
+        return 0;
+    }
+
     /* --- Messaging --- */
 
     if (strcmp(stmt->type, "SendMsg") == 0) {

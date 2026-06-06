@@ -328,6 +328,25 @@ void dispatch_swarm_message(Carrier *c,
         return it == message.body.end() ? std::string{} : it->second;
     };
 
+    /* Content moderation (CMP-002): drop every commit authored by a blocked
+     * identity before it becomes an event — text, group messages, and file
+     * offers alike. The 1:1 libjami ban (carrier_block_peer) already stops
+     * acknowledging direct messages, but shared Swarms a blocked peer is also
+     * a member of are not covered by 1:1 trust, so we gate on author here.
+     * Replay is gated too: a blocked peer's history must not resurface on
+     * cold-load. */
+    {
+        const std::string author = get("author");
+        if (!author.empty()) {
+            std::lock_guard<std::mutex> lock(c->accounts_mtx);
+            auto it = c->accounts.find(accountId);
+            if (it != c->accounts.end() &&
+                it->second.blocked_peers.count(author)) {
+                return;
+            }
+        }
+    }
+
     /* File-transfer offers: a Swarm commit of type
      * `application/data-transfer+json`. libjami's ConversationRepository
      * enriches the body map with `fileId` (computed from commitId + tid +
@@ -648,15 +667,31 @@ void replay_contacts(Carrier *c, const std::string &accountId)
             ? std::string{}
             : extract_vcard_fn(vcard);
 
+        /* CMP-002 — a libjami-banned contact (the user blocked them in a
+         * prior session) is still returned by getContacts; Contact::toMap()
+         * adds banned="true" only for the banned case. The ban itself
+         * persists on disk and syncs across the account's linked devices, so
+         * this replay is the durable, serverless source of truth for the
+         * block across restarts. We surface it to the consumer via the
+         * `blocked` flag so it can re-hydrate its render gate from the daemon
+         * ban rather than from process-local (e.g. wiped in-memory RDF) state. */
+        const auto banned_it = entry.find("banned");
+        const bool is_banned =
+            banned_it != entry.end() && banned_it->second == "true";
+
         /* Seed the contact_names cache so a later ProfileReceived for the
          * same (uri, name) pair is a no-op. Cache the (possibly empty)
          * name; a real ContactName arrival with a non-empty FN will then
-         * register as a change and emit through on_profile_received. */
+         * register as a change and emit through on_profile_received. For a
+         * banned peer, re-seed blocked_peers in the same locked pass so
+         * dispatch_swarm_message keeps dropping its group commits + file
+         * offers post-restart (the 1:1 libjami ban does not cover those). */
         {
             std::lock_guard<std::mutex> lock(c->accounts_mtx);
             auto ait = c->accounts.find(accountId);
             if (ait != c->accounts.end()) {
                 ait->second.contact_names[peer_uri] = display_name;
+                if (is_banned) ait->second.blocked_peers.insert(peer_uri);
             }
         }
 
@@ -665,6 +700,7 @@ void replay_contacts(Carrier *c, const std::string &accountId)
         set_account(qe.ev, accountId);
         copy_fixed(qe.ev.contact_restored.contact_uri, CARRIER_URI_LEN, peer_uri);
         copy_fixed(qe.ev.contact_restored.display_name, CARRIER_NAME_LEN, display_name);
+        qe.ev.contact_restored.blocked = is_banned;
         carrier_push_event(c, std::move(qe));
     }
 }

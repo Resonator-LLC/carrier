@@ -101,6 +101,19 @@ struct AccountState
      * on every account reconnect). Guarded by accounts_mtx. */
     std::unordered_map<std::string, std::string> contact_names;
 
+    /* Blocked peer identities (content moderation — CMP-002). Populated by
+     * carrier_block_peer (which also issues libjami removeContact ban=true);
+     * carrier_unblock_peer erases. dispatch_swarm_message drops any inbound
+     * commit whose author is in this set before it becomes an event, so a
+     * blocked peer's group messages and file offers — which 1:1 trust/ban
+     * does not govern — never surface. Re-seeded across restarts: replay_contacts
+     * (AccountReady) re-inserts every libjami-banned peer here from the daemon's
+     * persisted ban list, so the Swarm-commit drop survives a cold boot rather
+     * than resetting to "not blocked". The same pass flags carrier:ContactRestored
+     * with blocked=true so the pipeline re-hydrates its render gate too. Guarded
+     * by accounts_mtx. */
+    std::set<std::string> blocked_peers;
+
     /* Cache: conversation_id of this account's "Saved Messages" swarm
      * (single-member-self). Populated lazily by the first
      * carrier_get_saved_conversation call (find-or-create against

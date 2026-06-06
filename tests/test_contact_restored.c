@@ -61,6 +61,9 @@ TEST(test_contact_restored_with_display_name)
     ASSERT_STR_CONTAINS(out,
         "carrier:contactUri \"4748d985a10c8e84990f592a0ec0232efb733293\"");
     ASSERT_STR_CONTAINS(out, "carrier:displayName \"bob\"");
+    /* CMP-002 — blocked is structurally present; an un-banned restore is
+     * "false". */
+    ASSERT_STR_CONTAINS(out, "carrier:blocked \"false\"");
 
     /* Line must terminate with " .\n" — same convention as every other
      * carrier turtle line, so concatenated streams parse one-line-per-event. */
@@ -68,6 +71,30 @@ TEST(test_contact_restored_with_display_name)
     ASSERT(len >= 3);
     ASSERT(out[len - 1] == '\n');
     ASSERT(out[len - 2] == '.');
+
+    free(out);
+}
+
+TEST(test_contact_restored_banned_emits_blocked_true)
+{
+    /* CMP-002 — a libjami-banned contact (the user blocked them in a prior
+     * session) is replayed at AccountReady with blocked=true so consumers
+     * re-hydrate their render gate / blocklist from the durable ban rather
+     * than from process-local state. */
+    CarrierEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CARRIER_EVENT_CONTACT_RESTORED;
+    ev.timestamp = 1748000000000LL;
+    snprintf(ev.account_id, sizeof(ev.account_id), "c314a87070bc4c74");
+    snprintf(ev.contact_restored.contact_uri,
+             sizeof(ev.contact_restored.contact_uri),
+             "4748d985a10c8e84990f592a0ec0232efb733293");
+    ev.contact_restored.blocked = true;
+
+    char *out = emit_to_string(&ev);
+    ASSERT(out != NULL);
+    ASSERT_STR_CONTAINS(out, "[] a carrier:ContactRestored");
+    ASSERT_STR_CONTAINS(out, "carrier:blocked \"true\"");
 
     free(out);
 }
@@ -137,4 +164,5 @@ void test_contact_restored_all(void)
     RUN_TEST(test_contact_restored_with_display_name);
     RUN_TEST(test_contact_restored_empty_display_name_still_emits_predicate);
     RUN_TEST(test_contact_restored_escapes_display_name);
+    RUN_TEST(test_contact_restored_banned_emits_blocked_true);
 }
