@@ -1264,16 +1264,21 @@ void carrier_register_signals(Carrier *c)
             on_device_revocation_ended(c, accountId, deviceId, status);
         }));
 
-#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
-    // GetAppDataPath: iOS (and Android) libjami delegates filesystem-path
+#if (defined(TARGET_OS_IOS) && TARGET_OS_IOS) || defined(__ANDROID__)
+    // GetAppDataPath: iOS and Android libjami delegate filesystem-path
     // resolution to the embedder because the daemon has no idea where the
-    // sandbox container lives. fileutils::get_data_dir / get_config_dir /
-    // get_cache_dir all emit this signal with name="files" | "config" |
-    // "cache". If we don't register a handler, get_data_dir() returns
-    // empty and every "<account_id>/config.yml" lookup goes through a
-    // relative path against the daemon's CWD — YAML::LoadFile throws
-    // `bad file: <id>/config.yml` (observed on iPhone 17 Pro sim in
-    // Cut 8.5).
+    // sandbox container lives. fileutils::{get_data_dir,get_config_dir,
+    // get_cache_dir,get_home_dir} all emit this signal with name="files" |
+    // "config" | "cache" (see jami-daemon src/fileutils.cpp, guarded by the
+    // same `__ANDROID__ || TARGET_OS_IOS` condition mirrored here). If we
+    // don't register a handler, get_data_dir() returns empty and every
+    // "<account_id>/config.yml" lookup goes through a relative path against
+    // the daemon's CWD — YAML::LoadFile throws `bad file: <id>/config.yml`
+    // (observed on iPhone 17 Pro sim in Cut 8.5), or the account is minted
+    // in memory and registered on the DHT but never written to disk, so it
+    // is lost on restart and Swarm git repos are never created — observed on
+    // Android emulator-5554 as ISSUE-128 (config.yml absent,
+    // carrier_get_saved_conversation == -1).
     //
     // We map the three kinds onto `c->data_dir`:
     //   files  → <data_dir>           (account folders live here)
