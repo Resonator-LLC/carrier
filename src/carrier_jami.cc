@@ -8,6 +8,7 @@
  *  under the MIT License.
  */
 
+#include "account_defaults.hpp"
 #include "carrier_internal.hpp"
 #include "carrier_log.h"
 #include "rdf_canon.h"
@@ -392,6 +393,7 @@ extern "C" int carrier_create_account(Carrier    *c,
     if (importing) {
         details["Account.archivePath"] = archive_path_or_null;
     }
+    carrier_account::apply_platform_defaults(details, carrier_account::kIosBuild);
 
     const std::string accountId = libjami::addAccount(details);
     if (accountId.empty()) {
@@ -1158,6 +1160,7 @@ extern "C" int carrier_create_linking_account(Carrier *c,
     details["Account.archiveURL"]         = "jami-auth";
     details["Account.archiveHasPassword"] = "false";
     details["Account.archivePassword"]    = "";
+    carrier_account::apply_platform_defaults(details, carrier_account::kIosBuild);
 
     const std::string accountId = libjami::addAccount(details);
     if (accountId.empty()) {

@@ -23,6 +23,7 @@ int test_current_failed = 0;
 void test_vcard_utils_all(void);
 void test_rdf_canon_all(void);
 void test_contact_restored_all(void);
+void test_account_defaults_all(void);
 
 int main(void)
 {
@@ -32,6 +33,7 @@ int main(void)
     test_vcard_utils_all();
     test_rdf_canon_all();
     test_contact_restored_all();
+    test_account_defaults_all();
 
     printf("\n------------------\n");
     printf("%d tests, %d passed, %d failed\n",

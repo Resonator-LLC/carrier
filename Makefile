@@ -470,7 +470,7 @@ $(BUILD_DIR):
 
 TEST_DIR        = tests
 TEST_C_SRC      = test_main.c test_rdf_canon.c test_contact_restored.c
-TEST_CXX_SRC    = test_vcard_utils.cc
+TEST_CXX_SRC    = test_vcard_utils.cc test_account_defaults.cc
 TEST_C_OBJ      = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_C_SRC:.c=.o))
 TEST_CXX_OBJ    = $(addprefix $(BUILD_DIR)/$(TEST_DIR)/, $(TEST_CXX_SRC:.cc=.o))
 # turtle_emit.o is normally a CLI-only object (it depends on carrier.h's
