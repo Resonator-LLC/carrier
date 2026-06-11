@@ -6,28 +6,30 @@ Thank you for your interest in contributing to Carrier.
 
 ### Prerequisites
 
-- C11 compiler (gcc or clang)
-- CMake 3.16+ (for toxcore)
-- pkg-config
-- libsodium, opus, libvpx
+- C11 + C++20 compiler (gcc or clang)
+- GNU make
+- `curl` + `tar` (to fetch the pre-built libjami prefix)
+- Python 3 (end-to-end tests)
+
+All third-party C/C++ dependencies come from the hermetic libjami prefix — nothing
+is needed from the system package manager.
 
 ### Building
 
 ```bash
-# Clone with submodules
+# Clone with submodules (serd)
 git clone --recursive https://source.resonator.network/resonator/carrier.git
 cd carrier
 
-# Build toxcore (see README.md for details)
-# Then:
+make libjami    # populate the libjami prefix (see README.md)
 make
 make test
 ```
 
 ## Code Style
 
-- **Standard:** C11 (`-std=c11`)
-- **Warnings:** `-Wall -Wextra -Wpedantic` must compile clean
+- **Standard:** C11 (`-std=c11`) for C sources; C++20 (`-std=c++20`) for the libjami shim
+- **Warnings:** `-Wall -Wextra` must compile clean
 - **Indentation:** 4 spaces, no tabs
 - **Line length:** 100 characters soft limit
 - **Braces:** Opening brace on same line

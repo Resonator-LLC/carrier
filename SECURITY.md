@@ -27,8 +27,8 @@ If you discover a security vulnerability, please report it privately:
 
 | Version | Supported |
 |---------|-----------|
-| 2.x     | Yes       |
-| < 2.0   | No        |
+| 3.x     | Yes       |
+| < 3.0   | No        |
 
 ## Scope
 
@@ -41,5 +41,8 @@ The following are in scope:
 
 Out of scope:
 
-- Vulnerabilities in toxcore itself (report to [c-toxcore](https://github.com/TokTok/c-toxcore))
+- Vulnerabilities in libjami / jami-daemon itself (report to
+  [Jami](https://git.jami.net/savoirfairelinux/jami-daemon))
+- Vulnerabilities in libjami's contrib dependencies — OpenDHT, dhtnet, pjsip,
+  GnuTLS, OpenSSL, FFmpeg, libgit2, etc. (report upstream)
 - Vulnerabilities in serd (report upstream)
