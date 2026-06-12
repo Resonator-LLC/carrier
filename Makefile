@@ -189,6 +189,17 @@ CXX := $(ANDROID_NDK_BIN)/$(ANDROID_HOST_TRIPLE)$(ANDROID_API_LEVEL)-clang++
 AR  := $(ANDROID_NDK_BIN)/llvm-ar
 endif
 
+# macOS host builds: pin the deployment target so libcarrier.a objects match
+# the libjami contrib cache (CI tarball is built for macOS 14). Without this,
+# clang defaults to the running OS version and every consumer link warns
+# "object file was built for newer 'macOS' version".
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(PLATFORM),host)
+MACOS_MIN   ?= 14.0
+MACOS_FLAGS := -mmacosx-version-min=$(MACOS_MIN)
+endif
+endif
+
 CFLAGS   ?= -std=c11 -D_DEFAULT_SOURCE $(COMMON_WARN)
 CFLAGS   += $(COMMON_INC) -DSERD_STATIC
 
@@ -205,6 +216,10 @@ endif
 ifeq ($(PLATFORM),android-arm64)
 CFLAGS   += $(ANDROID_FLAGS)
 CXXFLAGS += $(ANDROID_FLAGS)
+endif
+ifneq ($(MACOS_FLAGS),)
+CFLAGS   += $(MACOS_FLAGS)
+CXXFLAGS += $(MACOS_FLAGS)
 endif
 
 # ---------------------------------------------------------------------------
@@ -311,6 +326,9 @@ SERD_CFLAGS += $(IOS_FLAGS)
 endif
 ifeq ($(PLATFORM),android-arm64)
 SERD_CFLAGS += $(ANDROID_FLAGS)
+endif
+ifneq ($(MACOS_FLAGS),)
+SERD_CFLAGS += $(MACOS_FLAGS)
 endif
 
 # Library sources — mix of C++ (shim + internals that touch C++ state) and C.
