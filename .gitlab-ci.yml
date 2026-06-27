@@ -101,8 +101,14 @@ publish:apple:
 #
 # The image is the amd64-ONLY tag (amd64/ubuntu) rather than the multi-arch
 # `ubuntu`, so the job always produces the x86_64-linux-gnu triple regardless
-# of the runner host's architecture: native on an x86_64 runner, QEMU-emulated
-# on an arm64 host. Emulated builds are much slower — hence the wide timeout.
+# of the runner host's architecture.
+#
+# GATED (when: manual + allow_failure) pending a NATIVE x86_64 `linux` runner.
+# Emulating x86_64 on the arm64 Mac runner reliably dies in the contrib build
+# (GNU Make "write jobserver: Bad file descriptor" under Rosetta), so this job
+# is not run automatically and never fails the pipeline. To re-enable: register
+# an x86_64 runner tagged `linux`, then delete the `when:` + `allow_failure:`
+# lines so it auto-publishes on JAMI_VERSION bumps like publish:apple.
 publish:linux:
   stage: publish
   tags:
@@ -110,6 +116,8 @@ publish:linux:
   image: amd64/ubuntu:24.04
   timeout: 8h
   interruptible: false
+  when: manual
+  allow_failure: true
   variables:
     PLATFORM: host
     # Keep prefix + contrib tarballs inside the project dir so GitLab's cache:
