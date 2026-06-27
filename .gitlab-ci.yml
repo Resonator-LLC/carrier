@@ -1,0 +1,132 @@
+# CI for carrier: build the pre-built libjami static prefixes and publish them
+# to this project's GitLab Generic Package Registry.
+#
+# Replaces the old GitHub Actions workflow (.github/workflows/build-libjami-
+# artifacts.yml). For each supported triple it runs tools/build-libjami.sh at
+# the SHA pinned in JAMI_VERSION, packs the resulting cache prefix as
+# libjami-<sha>-<triple>.tar.zst (zstd -19), and uploads it (plus a .sha256)
+# under package `libjami`, version `<sha>`. Once published, `make libjami`
+# (tools/fetch-libjami.sh) downloads + verifies these instead of building from
+# source on every dev machine.
+#
+# Runners (source.resonator.network):
+#   - Apple targets (macOS-arm64 host + both iOS slices) run on the workspace
+#     Mac (shell executor, tag `macos`), reusing its on-disk ~/.cache contrib
+#     cache across jobs and dev sessions.
+#   - Linux x86_64 runs on a Docker-executor runner tagged `linux` using the
+#     ubuntu:24.04 image; its contrib-tarball cache is kept inside the project
+#     dir (via XDG_CACHE_HOME) so GitLab's cache: can persist it.
+#
+# Not built here: macOS-x86_64. The instance has no Intel-mac runner; Intel
+# Macs fall back to a source build (`make libjami-build`) until one is added.
+#
+# Cold builds take 1-3h per triple. Re-running the same SHA is cheap — the
+# build script is idempotent and the contrib cache is warm.
+
+stages:
+  - publish
+
+# Gate the WHOLE pipeline: only run on a SHA bump (auto-publish), or a manual
+# "Run pipeline" / trigger. Ordinary pushes must NOT kick off a multi-hour
+# build. JAMI_VERSION is the single source of truth for which libjami the
+# project consumes, so any commit that changes it should produce a fresh set.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - JAMI_VERSION
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+variables:
+  # build-libjami.sh clones jami-daemon itself; carrier's own submodules
+  # (serd/toxcore/cmp) are irrelevant to the libjami build — skip them.
+  GIT_SUBMODULE_STRATEGY: none
+
+# Shared build → pack → publish flow. $PLATFORM is set per job/matrix entry.
+# Anchored so both the Apple and Linux jobs run identical publish logic.
+.publish-script: &publish-script
+  - sha="$(tr -d '[:space:]' < JAMI_VERSION)"
+  - test -n "$sha" || { echo "JAMI_VERSION is empty" >&2; exit 1; }
+  - ./tools/build-libjami.sh --platform="$PLATFORM"
+  - prefix="$(./tools/build-libjami.sh --print-prefix --platform="$PLATFORM")"
+  # artifact_triple is kernel-version-stripped on macOS, so one tarball serves
+  # every macOS host.
+  - triple="$(awk -F= '/^artifact_triple=/{print $2}' "$prefix/MANIFEST")"
+  - asset="libjami-${sha}-${triple}.tar.zst"
+  - tar --use-compress-program='zstd -19 -T0' -C "$(dirname "$prefix")" -cf "$asset" "$(basename "$prefix")"
+  - |
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$asset" > "$asset.sha256"
+    else
+      shasum -a 256 "$asset" > "$asset.sha256"
+    fi
+  - ls -la "$asset" "$asset.sha256"
+  - |
+    base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/libjami/${sha}"
+    for f in "$asset" "$asset.sha256"; do
+      echo "==> Uploading $f -> $base/$f"
+      curl --fail --silent --show-error --retry 3 \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file "$f" "$base/$f"
+      echo
+    done
+
+# macOS-arm64 host + both iOS slices, on the single Apple runner. The matrix
+# entries queue sequentially on the one Mac; later slices reuse the warm
+# ~/.cache/resonator contrib cache populated by the host build.
+publish:apple:
+  stage: publish
+  tags:
+    - macos
+  timeout: 4h
+  interruptible: false
+  before_script:
+    # The shell executor inherits a minimal launchd PATH.
+    - export PATH="/opt/homebrew/bin:$PATH"
+    # Tools only (no libraries — brewed libs leak into pkg-config detection and
+    # break build-libjami.sh's --ignore-system-libs). Mirrors the README macOS
+    # list plus cmake/ninja/nasm and zstd for packing.
+    - brew install automake libtool gettext nasm yasm ninja cmake pkg-config zstd
+  parallel:
+    matrix:
+      - PLATFORM: [host, ios-device, ios-simulator]
+  script: *publish-script
+
+# Linux x86_64 on a Docker runner. apt list mirrors jami-daemon's top-level
+# Dockerfile (minus Node/SWIG and the BUILD_TESTING-only packages), plus zstd
+# and ca-certificates for packing + https fetches.
+publish:linux:
+  stage: publish
+  tags:
+    - linux
+  image: ubuntu:24.04
+  timeout: 4h
+  interruptible: false
+  variables:
+    PLATFORM: host
+    # Keep prefix + contrib tarballs inside the project dir so GitLab's cache:
+    # can persist the tarballs across runs (Docker jobs are ephemeral).
+    XDG_CACHE_HOME: "$CI_PROJECT_DIR/.cache"
+  cache:
+    # Content-addressed upstream archives only — never the partial src tree
+    # (a failed build would poison it). Shared across SHA bumps.
+    key: libjami-tarballs-linux
+    paths:
+      - .cache/resonator/libjami-tarballs/
+  before_script:
+    - apt-get update -qq
+    - |
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        autoconf automake autopoint bison build-essential cmake curl git \
+        ca-certificates zstd \
+        libarchive-dev libasio-dev libasound2-dev libdbus-1-dev \
+        libexpat1-dev libfmt-dev libgmp-dev nettle-dev libgnutls28-dev \
+        libjsoncpp-dev libmsgpack-dev libnatpmp-dev libopus-dev \
+        libpipewire-0.3-dev libpulse-dev libspeex-dev libspeexdsp-dev \
+        libssl-dev libsystemd-dev libtool libudev-dev libupnp-dev \
+        libva-dev libvdpau-dev libvpx-dev libx264-dev libyaml-cpp-dev \
+        libhttp-parser-dev libwebrtc-audio-processing-dev \
+        libsecp256k1-dev guile-3.0-dev nasm pkg-config yasm
+  script: *publish-script

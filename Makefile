@@ -36,9 +36,9 @@ PREFIX ?= /usr/local
 #   make libjami PLATFORM=ios-device      — iPhone arm64 slice
 #   make libjami PLATFORM=ios-simulator   — Simulator arm64+x86_64 (fat)
 #
-# Pre-built tarballs are produced by .github/workflows/build-libjami-artifacts.yml
-# whenever JAMI_VERSION changes on main; see arch/jami-migration.md D21 for the
-# overall design rationale.
+# Pre-built tarballs are produced by .gitlab-ci.yml (GitLab Generic Package
+# Registry) whenever JAMI_VERSION changes on the default branch; see
+# arch/jami-migration.md D21 for the overall design rationale.
 # ---------------------------------------------------------------------------
 
 PLATFORM ?= host

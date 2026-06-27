@@ -13,10 +13,9 @@
 # Falls back to `make libjami-build` instructions if the artefact for this
 # triple isn't published yet.
 #
-# Tarballs are produced by .github/workflows/build-libjami-artifacts.yml
-# and uploaded to a release tagged `libjami-<sha>` on this repo. The iOS
-# slices are added in Cut 8 (impl-plan §3.2); until then `--platform=ios-*`
-# routes to source build via the fallback message.
+# Tarballs are produced by .gitlab-ci.yml and uploaded to the carrier
+# project's GitLab Generic Package Registry under package `libjami`,
+# version `<sha>` (file `libjami-<sha>-<triple>.tar.zst`).
 #
 # Usage:
 #   tools/fetch-libjami.sh                            # host
@@ -79,38 +78,62 @@ if [ -f "$PREFIX/lib/libjami-core.a" ]; then
   exit 0
 fi
 
-# Repo URL: override via JAMI_RELEASE_REPO. Default matches antenna's
-# carrier submodule URL (https://github.com/Resonator-LLC/carrier).
-RELEASE_REPO="${JAMI_RELEASE_REPO:-Resonator-LLC/carrier}"
-TAG="libjami-$SHA"
+# Pre-built tarballs live in the carrier project's GitLab Generic Package
+# Registry: package `libjami`, version `<sha>`, file `<asset>`. Override the
+# API host or project path via env. Auth: inside CI use CI_JOB_TOKEN; on a
+# dev machine set JAMI_GITLAB_TOKEN to a token with read_package_registry.
+GITLAB_API="${JAMI_GITLAB_API:-https://source.resonator.network/api/v4}"
+GITLAB_PROJECT="${JAMI_GITLAB_PROJECT:-resonator%2Fcarrier}"
 ASSET="libjami-$SHA-$TRIPLE.tar.zst"
-URL="https://github.com/$RELEASE_REPO/releases/download/$TAG/$ASSET"
+URL="$GITLAB_API/projects/$GITLAB_PROJECT/packages/generic/libjami/$SHA/$ASSET"
 SHA256_URL="$URL.sha256"
+
+if [ -n "${CI_JOB_TOKEN:-}" ]; then
+  AUTH_HEADER="JOB-TOKEN: $CI_JOB_TOKEN"
+elif [ -n "${JAMI_GITLAB_TOKEN:-}" ]; then
+  AUTH_HEADER="PRIVATE-TOKEN: $JAMI_GITLAB_TOKEN"
+else
+  cat <<EOF >&2
+ERROR: no GitLab credential for the libjami package registry.
+
+Set JAMI_GITLAB_TOKEN to a personal/deploy token with read_package_registry
+scope (CI provides CI_JOB_TOKEN automatically). Or build from source:
+
+  tools/build-libjami.sh --platform=$PLATFORM
+EOF
+  exit 1
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> Fetching $URL"
-if ! curl -fL --retry 3 -o "$TMP/$ASSET" "$URL" 2>/dev/null; then
+if ! curl -fL --retry 3 --header "$AUTH_HEADER" -o "$TMP/$ASSET" "$URL" 2>/dev/null; then
   cat <<EOF >&2
-ERROR: pre-built artefact not found for $TRIPLE at $TAG.
+ERROR: pre-built artefact not found for $TRIPLE at sha $SHA.
 
-Either the release hasn't been published yet for this triple (iOS tarballs
-are added in Cut 8 / impl-plan §3.2 — until then iOS slices source-build
-on every dev machine), or the SHA in JAMI_VERSION doesn't have a
-corresponding release. Build from source:
+Either the package hasn't been published for this triple yet, the SHA in
+JAMI_VERSION has no published package, or the token lacks access. Build from
+source:
 
   tools/build-libjami.sh --platform=$PLATFORM
 
-(or trigger .github/workflows/build-libjami-artifacts.yml on $RELEASE_REPO)
+(or run carrier's .gitlab-ci.yml publish pipeline to build + upload it)
 EOF
   exit 1
 fi
 
-curl -fL --retry 3 -o "$TMP/$ASSET.sha256" "$SHA256_URL"
+curl -fL --retry 3 --header "$AUTH_HEADER" -o "$TMP/$ASSET.sha256" "$SHA256_URL"
 
 echo "==> Verifying sha256"
-( cd "$TMP" && shasum -a 256 -c "$ASSET.sha256" )
+(
+  cd "$TMP"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$ASSET.sha256"
+  else
+    shasum -a 256 -c "$ASSET.sha256"
+  fi
+)
 
 echo "==> Extracting to $CACHE_ROOT/libjami/"
 mkdir -p "$CACHE_ROOT/libjami"
