@@ -97,12 +97,17 @@ publish:apple:
 # Linux x86_64 on a Docker runner. apt list mirrors jami-daemon's top-level
 # Dockerfile (minus Node/SWIG and the BUILD_TESTING-only packages), plus zstd
 # and ca-certificates for packing + https fetches.
+#
+# The image is the amd64-ONLY tag (amd64/ubuntu) rather than the multi-arch
+# `ubuntu`, so the job always produces the x86_64-linux-gnu triple regardless
+# of the runner host's architecture: native on an x86_64 runner, QEMU-emulated
+# on an arm64 host. Emulated builds are much slower — hence the wide timeout.
 publish:linux:
   stage: publish
   tags:
     - linux
-  image: ubuntu:24.04
-  timeout: 4h
+  image: amd64/ubuntu:24.04
+  timeout: 8h
   interruptible: false
   variables:
     PLATFORM: host
