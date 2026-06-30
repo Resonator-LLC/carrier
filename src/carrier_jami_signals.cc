@@ -84,9 +84,9 @@ void on_registration_state(Carrier *c,
 {
     /* Maintain the per-account registered flag. Use operator[] (lazy-
      * insert) instead of find() so the signal isn't lost if it arrives
-     * BEFORE carrier_create_account had a chance to populate the entry —
-     * which it does, since carrier_create_account now blocks on
-     * accounts_cv until `registered` flips. */
+     * BEFORE create / import / load populated the entry. The notify_all()
+     * below wakes the detached registration finalizer (which runs the history
+     * replay on REGISTERED and the 30s timeout otherwise). */
     bool first_registered = false;
     {
         std::lock_guard<std::mutex> lock(c->accounts_mtx);

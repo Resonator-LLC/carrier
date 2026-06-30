@@ -20,6 +20,7 @@
 #include <jami/presencemanager_interface.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -359,6 +361,87 @@ void emit_account_error(Carrier *c, const std::string &accountId, const char *ca
     carrier_push_event(c, std::move(qe));
 }
 
+/* ---------------------------------------------------------------------------
+ * Registration finalizer — non-blocking account lifecycle.
+ *
+ * create / import / load no longer park antenna's single worker thread on the
+ * RegistrationStateChanged → REGISTERED wait (that block froze the whole
+ * antenna-driven UI for up to 30s — no event drain, no SPARQL, no scene pulls).
+ * Instead they spawn this detached thread, which absorbs the wait off the
+ * worker and does the two things the old inline wait did:
+ *
+ *   1. Bounds registration with a single 30s timed wait on accounts_cv (woken
+ *      early by REGISTERED or an ERROR_* the signal handler stashed). NOT a
+ *      poll. On timeout it emits carrier:AccountError cause="register-timeout".
+ *   2. On REGISTERED, runs the history-replay kick (loadConversation per on-disk
+ *      Swarm) — sequenced exactly where it ran before: AFTER
+ *      loadAccountAndConversation / addAccount returned (swarms hydrated) and
+ *      AFTER REGISTERED (accountManager_ live), but on this throwaway thread
+ *      rather than the worker, and off the libjami signal thread (which must
+ *      not re-enter libjami — see on_registration_state's :161 note).
+ *
+ * AccountReady / Connected / ConversationReady / ContactRestored are still
+ * emitted by on_registration_state on the REGISTERED signal; this thread only
+ * adds the timeout net and the history replay.
+ *
+ * `c` is process-scoped (libjami init/fini is process-wide and carrier is never
+ * freed mid-session — hot-restart rebinds, ISSUE-122), so the detached thread's
+ * borrow outlives its 30s lifetime.
+ */
+void run_registration_finalizer(Carrier *c, std::string account_id)
+{
+    bool registered = false;
+    bool errored = false;
+    {
+        std::unique_lock<std::mutex> lock(c->accounts_mtx);
+        c->accounts_cv.wait_for(
+            lock, std::chrono::seconds(30),
+            [&]() {
+                auto it = c->accounts.find(account_id);
+                if (it == c->accounts.end()) return false;
+                return it->second.registered || !it->second.error_state.empty();
+            });
+        auto it = c->accounts.find(account_id);
+        registered = (it != c->accounts.end() && it->second.registered);
+        errored = (it != c->accounts.end() && !it->second.error_state.empty());
+    }
+
+    if (errored) {
+        /* AccountError already enqueued by on_registration_state with a
+         * translated cause token — don't double-emit. */
+        return;
+    }
+    if (!registered) {
+        CLOG_ERROR(c, "SHIM", "account %s did not register within 30s",
+                   account_id.c_str());
+        emit_account_error(c, account_id, "register-timeout");
+        return;
+    }
+
+    /* History replay kick (ISSUE-127): REGISTERED has fired and
+     * loadAccountAndConversation / addAccount has returned, so every on-disk
+     * Swarm is hydrated — safe to walk each git log. The SwarmLoaded handler
+     * turns each commit into a Text/Group/File event. Fresh-create has no
+     * swarms, so the loop is a no-op. */
+    try {
+        const auto convs = libjami::getConversations(account_id);
+        for (const auto &conv_id : convs) {
+            libjami::loadConversation(account_id, conv_id, "", 0);
+        }
+    } catch (const std::exception &e) {
+        CLOG_WARN(c, "SHIM",
+                  "registration finalizer: history replay kick threw for %s: %s",
+                  account_id.c_str(), e.what());
+    }
+}
+
+/* Spawn run_registration_finalizer detached so the calling worker thread
+ * returns immediately. */
+void spawn_registration_finalizer(Carrier *c, const std::string &account_id)
+{
+    std::thread(run_registration_finalizer, c, account_id).detach();
+}
+
 } /* anonymous namespace */
 
 extern "C" int carrier_create_account(Carrier    *c,
@@ -411,67 +494,17 @@ extern "C" int carrier_create_account(Carrier    *c,
         if (display_name) st.display_name = display_name;
     }
 
-    /* Block until libjami fires RegistrationStateChanged → REGISTERED on
-     * this account. Before that point JamiAccount::accountManager_ is
-     * still null, and any libjami call that derefs it (updateProfile,
-     * sendMessage, getKnownDevices, …) null-derefs. On macOS the
-     * registration is fast enough that pipelines win the race almost
-     * always; on iOS sim the race loses reliably (crash in
-     * jami::JamiAccount::updateProfile observed in Cut 8.5 / 8.6).
-     *
-     * 30 s is the cold-account budget — first-time minting also fetches
-     * an OpenDHT InfoHash and registers with the bootstrap peers. The
-     * predicate also wakes on ERROR_* so wrong-pin / corrupted-archive
-     * imports return -1 within seconds instead of after the full wait. */
-    bool errored = false;
-    {
-        std::unique_lock<std::mutex> lock(c->accounts_mtx);
-        const bool ok = c->accounts_cv.wait_for(
-            lock, std::chrono::seconds(30),
-            [&]() {
-                auto it = c->accounts.find(accountId);
-                if (it == c->accounts.end()) return false;
-                return it->second.registered || !it->second.error_state.empty();
-            });
-        if (!ok) {
-            CLOG_ERROR(c, "SHIM",
-                       "account %s did not register within 30s; the "
-                       "account exists but accountManager_ may not be "
-                       "ready — subsequent libjami calls may null-deref",
-                       accountId.c_str());
-            emit_account_error(c, accountId, "register-timeout");
-            return -1;
-        }
-        auto it = c->accounts.find(accountId);
-        errored = (it != c->accounts.end() && !it->second.error_state.empty());
-    }
-    if (errored) {
-        /* AccountError was already enqueued by the signal handler with a
-         * translated cause token — don't double-emit. */
-        return -1;
-    }
-
     copy_to(out_account_id, CARRIER_ACCOUNT_ID_LEN, accountId);
-    CLOG_INFO(c, "SHIM", "%s account %s",
+    CLOG_INFO(c, "SHIM", "%s account %s (registering)",
               importing ? "imported" : "created", accountId.c_str());
 
-    /* Import-account path (archive carries existing swarms) kicks the
-     * same history replay as carrier_load_account — fresh-create has no
-     * swarms so the loop is a no-op. See the comment in
-     * carrier_load_account for why this lives here instead of
-     * on_registration_state's cold-load loop. */
-    if (importing) {
-        try {
-            const auto convs = libjami::getConversations(accountId);
-            for (const auto &conv_id : convs) {
-                libjami::loadConversation(accountId, conv_id, "", 0);
-            }
-        } catch (const std::exception &e) {
-            CLOG_WARN(c, "SHIM",
-                      "import_account: history replay kick threw for %s: %s",
-                      accountId.c_str(), e.what());
-        }
-    }
+    /* Non-blocking: the REGISTERED wait, the 30s timeout, and the import
+     * history replay all run on the finalizer thread so this call returns to
+     * antenna's worker immediately. AccountReady / Connected / AccountError
+     * arrive asynchronously via the event queue (on_registration_state). The
+     * pipeline gates account-dependent emits (SetNick, sendMessage) on
+     * AccountReady, so nothing derefs a not-yet-live accountManager_. */
+    spawn_registration_finalizer(c, accountId);
     return 0;
 }
 
@@ -504,55 +537,35 @@ extern "C" int carrier_load_account(Carrier *c, const char *account_id)
         }
     }
 
-    /* Same wait as carrier_create_account: block until libjami fires
-     * REGISTERED, so accountManager_ is non-null by the time we return
-     * and the next pipeline emit (e.g. carrier:SetNick) doesn't race
-     * into a half-initialised JamiAccount. Load-from-disk is typically
-     * faster than fresh mint (no DHT bootstrap), but the race window
-     * still exists. ERROR_* short-circuits via the same predicate. */
-    bool errored = false;
-    {
-        std::unique_lock<std::mutex> lock(c->accounts_mtx);
-        const bool ok = c->accounts_cv.wait_for(
-            lock, std::chrono::seconds(30),
-            [&]() {
-                auto it = c->accounts.find(account_id);
-                if (it == c->accounts.end()) return false;
-                return it->second.registered || !it->second.error_state.empty();
-            });
-        if (!ok) {
-            CLOG_ERROR(c, "SHIM",
-                       "account %s did not register within 30s",
-                       account_id);
-            emit_account_error(c, account_id, "register-timeout");
-            return -1;
+    /* iOS: an account created before the DHT-proxy default existed (or any
+     * plain full-DHT account) can't keep a node alive under background
+     * suspension, so it never reaches connected — those need the proxy preset
+     * applied on load. But an account that is ALREADY on the proxy must NOT be
+     * reconfigured here: libjami treats setAccountDetails as a config change and
+     * unregisters + reloads the account (observed on device: "Set account
+     * details" -> "Unregistering account" -> "DHT shutdown" mid-registration),
+     * churning the cold-start registration. The proxy config persists on disk,
+     * so a proxy account loads already-configured — only migrate the ones that
+     * aren't. Desktop keeps the full-DHT path (kIosBuild == false). */
+    if (carrier_account::kIosBuild) {
+        const auto proxy_it   = details.find("Account.proxyServer");
+        const auto enabled_it = details.find("Account.proxyEnabled");
+        const bool already_on_proxy =
+            proxy_it != details.end() &&
+            proxy_it->second == carrier_account::kResonatorProxyServer &&
+            enabled_it != details.end() && enabled_it->second == "true";
+        if (!already_on_proxy) {
+            libjami::setAccountDetails(account_id,
+                                       carrier_account::resonator_dht_defaults());
         }
-        auto it = c->accounts.find(account_id);
-        errored = (it != c->accounts.end() && !it->second.error_state.empty());
-    }
-    if (errored) return -1;
-
-    /* History replay kick (ISSUE-127). Now that `loadAccountAndConversation`
-     * has returned and REGISTERED has fired, every on-disk Swarm is fully
-     * hydrated in libjami's `conversations_` map — safe to ask for a
-     * git-log walk per swarm. The SwarmLoaded handler in carrier_jami_signals
-     * dispatches each commit as a TextMessage / GroupMessage / FileRecv
-     * event (replay path keeps own-author commits, unlike the live filter).
-     * The synthetic CONVERSATION_READY for each Swarm has already been
-     * pushed onto the carrier event queue by `on_registration_state`. */
-    try {
-        const auto convs = libjami::getConversations(account_id);
-        for (const auto &conv_id : convs) {
-            libjami::loadConversation(account_id, conv_id, "", 0);
-        }
-    } catch (const std::exception &e) {
-        CLOG_WARN(c, "SHIM",
-                  "load_account: history replay kick threw for %s: %s",
-                  account_id, e.what());
-        /* Non-fatal — account is still usable, just without cold-start
-         * history. Live messages will still surface. */
     }
 
+    /* Non-blocking: the REGISTERED wait, the 30s timeout, and the history
+     * replay run on the finalizer thread so this call returns to antenna's
+     * worker immediately instead of parking it for up to 30s (the cold-load
+     * UI freeze). ERROR_* / register-timeout surface asynchronously as
+     * carrier:AccountError via the event queue. */
+    spawn_registration_finalizer(c, account_id);
     return 0;
 }
 
@@ -671,6 +684,69 @@ extern "C" int carrier_set_nick(Carrier *c, const char *account_id, const char *
     if (auto *acct = find_account(c, account_id)) {
         acct->display_name = display;
     }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Network / DHT configuration
+ * ---------------------------------------------------------------------------*/
+
+extern "C" int carrier_apply_dht_preset(Carrier *c, const char *account_id)
+{
+    if (!c || !account_id) return -1;
+
+    /* setAccountDetails merges this partial map over the existing config, so
+     * only the proxy/bootstrap knobs change. libjami reloads the account and
+     * re-registers over the proxy as a side effect. */
+    libjami::setAccountDetails(account_id, carrier_account::resonator_dht_defaults());
+
+    CLOG_INFO(c, "SHIM",
+              "applied Resonator DHT preset to %s (proxy %s, bootstrap %s)",
+              account_id, carrier_account::kResonatorProxyServer,
+              carrier_account::kResonatorBootstrap);
+    return 0;
+}
+
+extern "C" int carrier_set_account_config(Carrier    *c,
+                                          const char *account_id,
+                                          int         proxy_enabled,
+                                          const char *dht_proxy_list_url_or_null,
+                                          const char *proxy_server_or_null,
+                                          const char *bootstrap_or_null,
+                                          const char *turn_server_or_null,
+                                          const char *turn_username_or_null,
+                                          const char *turn_password_or_null)
+{
+    if (!c || !account_id) return -1;
+
+    std::map<std::string, std::string> update;
+    if (proxy_enabled >= 0) {
+        update["Account.proxyEnabled"] = proxy_enabled ? "true" : "false";
+    }
+    const auto set_if = [&update](const char *key, const char *val) {
+        if (val && *val) update[key] = val;
+    };
+    set_if("Account.dhtProxyListUrl", dht_proxy_list_url_or_null);
+    set_if("Account.proxyServer",     proxy_server_or_null);
+    set_if("Account.hostname",        bootstrap_or_null);
+    set_if("TURN.server",             turn_server_or_null);
+    set_if("TURN.username",           turn_username_or_null);
+    set_if("TURN.password",           turn_password_or_null);
+    /* A non-empty TURN server implies the relay should be on; libjami ignores
+     * the credentials otherwise. */
+    if (turn_server_or_null && *turn_server_or_null) {
+        update["TURN.enable"] = "true";
+    }
+
+    if (update.empty()) {
+        CLOG_WARN(c, "SHIM", "set_account_config(%s): no fields to change",
+                  account_id);
+        return 0;
+    }
+
+    libjami::setAccountDetails(account_id, update);
+    CLOG_INFO(c, "SHIM", "set_account_config(%s): %zu key(s) updated",
+              account_id, update.size());
     return 0;
 }
 

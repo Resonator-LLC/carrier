@@ -623,6 +623,55 @@ int carrier_get_id(Carrier *c, const char *account_id);
 int carrier_set_nick(Carrier *c, const char *account_id, const char *nick);
 
 /* ---------------------------------------------------------------------------
+ * Network / DHT configuration
+ *
+ * Jami accounts reach the network either as a full DHT node (the desktop
+ * default) or through a DHT proxy — an HTTP(S) endpoint that performs DHT
+ * operations on the client's behalf. Mobile builds need the proxy because a
+ * full node's long-lived UDP socket can't survive OS background suspension.
+ * Carrier bakes the proxy in for iOS at account creation (see
+ * account_defaults.hpp); these calls reconfigure an already-created account
+ * at runtime — e.g. from the Station NETWORK settings pane.
+ *
+ * Both wrap libjami::setAccountDetails, which merges a partial detail map, so
+ * only the keys passed here change; the rest of the account config is left
+ * alone. The change is local — peers are not notified.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Apply Resonator's hardwired DHT defaults to `account_id` (the
+ * "Use Resonator DHT" preset): enable the proxy, point it at the bundled
+ * proxy/bootstrap endpoints. Idempotent. Returns 0/-1.
+ */
+int carrier_apply_dht_preset(Carrier *c, const char *account_id);
+
+/*
+ * Set individual network knobs on `account_id`. Every argument is optional:
+ *
+ *   proxy_enabled   tri-state — <0 leaves Account.proxyEnabled unchanged,
+ *                   0 sets "false", >0 sets "true".
+ *   *_or_null       NULL (or "") leaves that key unchanged; a non-empty value
+ *                   is written verbatim.
+ *
+ * dht_proxy_list_url -> Account.dhtProxyListUrl
+ * proxy_server       -> Account.proxyServer
+ * bootstrap          -> Account.hostname
+ * turn_server/turn_username/turn_password -> TURN.server/username/password
+ *                   (passing a non-empty turn_server also sets TURN.enable=true)
+ *
+ * Returns 0 on success, -1 if `c`/`account_id` is NULL.
+ */
+int carrier_set_account_config(Carrier    *c,
+                               const char *account_id,
+                               int         proxy_enabled,
+                               const char *dht_proxy_list_url_or_null,
+                               const char *proxy_server_or_null,
+                               const char *bootstrap_or_null,
+                               const char *turn_server_or_null,
+                               const char *turn_username_or_null,
+                               const char *turn_password_or_null);
+
+/* ---------------------------------------------------------------------------
  * Trust (contacts)
  *
  * Jami contacts are established via a two-sided trust exchange: one side

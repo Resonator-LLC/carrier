@@ -246,6 +246,41 @@ static int dispatch_statement(Carrier *c, const struct turtle_stmt *stmt)
         return 0;
     }
 
+    /* --- Network / DHT configuration --- */
+
+    if (strcmp(stmt->type, "SetAccountConfig") == 0) {
+        const char *account = require_account(c, stmt, "SetAccountConfig");
+        if (!account) return 0;
+
+        /* `carrier:preset "resonator"` applies the hardwired defaults; the
+         * pipeline's "Use Resonator DHT" button emits exactly that, so the
+         * proxy/bootstrap endpoints live in one place (account_defaults.hpp)
+         * rather than being duplicated into the radio. */
+        const char *preset = find_pred(stmt, "preset");
+        if (preset && strcmp(preset, "resonator") == 0) {
+            carrier_apply_dht_preset(c, account);
+            return 0;
+        }
+
+        /* Otherwise apply explicit per-field config. proxyEnabled is
+         * tri-state: absent leaves it unchanged, "true"/anything-else maps to
+         * 1/0. find_pred returns NULL for absent fields — exactly the
+         * "leave unchanged" contract carrier_set_account_config expects. */
+        const char *proxy_en_s = find_pred(stmt, "proxyEnabled");
+        int proxy_enabled = -1;
+        if (proxy_en_s) {
+            proxy_enabled = (strcmp(proxy_en_s, "true") == 0) ? 1 : 0;
+        }
+        carrier_set_account_config(c, account, proxy_enabled,
+                                   find_pred(stmt, "dhtProxyListUrl"),
+                                   find_pred(stmt, "proxyServer"),
+                                   find_pred(stmt, "bootstrap"),
+                                   find_pred(stmt, "turnServer"),
+                                   find_pred(stmt, "turnUsername"),
+                                   find_pred(stmt, "turnPassword"));
+        return 0;
+    }
+
     /* --- Trust --- */
 
     if (strcmp(stmt->type, "SendTrustRequest") == 0) {
